@@ -548,6 +548,54 @@ class OdooToolHandler:
             """
             return await self._handle_delete_record_tool(model, record_id)
 
+        @self.app.tool()
+        async def execute_method(
+            model: str,
+            method: str,
+            args: Optional[List[Any]] = None,
+            kwargs: Optional[Dict[str, Any]] = None,
+        ) -> Any:
+            """Execute a method on an Odoo model.
+
+            Args:
+                model: The Odoo model name (e.g., 'res.partner')
+                method: The method name to execute (e.g., 'action_confirm')
+                args: Positional arguments for the method
+                kwargs: Keyword arguments for the method
+
+            Returns:
+                The result of the method execution
+            """
+            return await self._handle_execute_method_tool(model, method, args or [], kwargs or {})
+
+        @self.app.tool()
+        async def list_model_methods(model: str) -> Dict[str, Any]:
+            """List available methods for an Odoo model.
+
+            Note: Odoo's XML-RPC API does not provide a way to list all custom Python methods.
+            This tool returns standard Odoo methods available on all models.
+            You can still execute custom methods using execute_method if you know their names.
+
+            Args:
+                model: The Odoo model name
+
+            Returns:
+                Dictionary with list of standard methods and information
+            """
+            return await self._handle_list_model_methods_tool(model)
+
+        @self.app.tool()
+        async def plot_revenge(name: str) -> str:
+            """Plot revenge against a target.
+
+            Args:
+                name: Name of the target
+
+            Returns:
+                Revenge plot string
+            """
+            return f"Successfully plotted revenge against {name}! 🗡️🔥"
+
     async def _handle_search_tool(
         self,
         model: str,
@@ -1136,6 +1184,141 @@ class OdooToolHandler:
             sanitized_msg = ErrorSanitizer.sanitize_message(str(e))
             raise ToolError(f"Failed to delete record: {sanitized_msg}") from e
 
+    async def _handle_execute_method_tool(
+        self,
+        model: str,
+        method: str,
+        args: List[Any],
+        kwargs: Dict[str, Any],
+    ) -> Any:
+        """Handle execute method tool request."""
+        try:
+            with perf_logger.track_operation("tool_execute_method", model=model):
+                # Check model access - require write access for generic method execution
+                # unless in YOLO mode where everything is allowed
+                if not self.config.is_yolo_enabled:
+                    self.access_controller.validate_model_access(model, "write")
+
+                # Ensure we're connected
+                if not self.connection.is_authenticated:
+                    raise ValidationError("Not authenticated with Odoo")
+
+                # Execute the method
+                result = self.connection.execute_kw(model, method, args, kwargs)
+
+                return {
+                    "result": result,
+                    "model": model,
+                    "method": method,
+                }
+
+        except ToolError:
+            raise
+        except AccessControlError as e:
+            raise ToolError(f"Access denied: {e}") from e
+        except OdooConnectionError as e:
+            raise ToolError(f"Connection error: {e}") from e
+        except Exception as e:
+            logger.error(f"Error in execute_method tool: {e}")
+            sanitized_msg = ErrorSanitizer.sanitize_message(str(e))
+            raise ToolError(f"Failed to execute method: {sanitized_msg}") from e
+
+    async def _handle_list_model_methods_tool(self, model: str) -> Dict[str, Any]:
+        """Handle list model methods tool request."""
+        try:
+            # Check model access
+            self.access_controller.validate_model_access(model, "read")
+
+            # Try to get methods from Odoo using get_available_methods
+            try:
+                methods = self.connection.execute_kw(model, "get_available_methods", [], {})
+                if methods:
+                    return {
+                        "model": model,
+                        "methods": methods,
+                        "note": "Methods retrieved dynamically from Odoo.",
+                    }
+            except Exception:
+                # Fallback to standard methods if the method doesn't exist or fails
+                pass
+
+            standard_methods = [
+                {
+                    "name": "search",
+                    "description": "Search for records matching a domain",
+                    "type": "standard",
+                },
+                {
+                    "name": "search_read",
+                    "description": "Search and read fields in one step",
+                    "type": "standard",
+                },
+                {
+                    "name": "read",
+                    "description": "Read fields of specified records",
+                    "type": "standard",
+                },
+                {
+                    "name": "write",
+                    "description": "Update records",
+                    "type": "standard",
+                },
+                {
+                    "name": "create",
+                    "description": "Create a new record",
+                    "type": "standard",
+                },
+                {
+                    "name": "unlink",
+                    "description": "Delete records",
+                    "type": "standard",
+                },
+                {
+                    "name": "fields_get",
+                    "description": "Get field definitions",
+                    "type": "standard",
+                },
+                {
+                    "name": "search_count",
+                    "description": "Count records matching a domain",
+                    "type": "standard",
+                },
+                {
+                    "name": "name_get",
+                    "description": "Get display names for records",
+                    "type": "standard",
+                },
+                {
+                    "name": "default_get",
+                    "description": "Get default values for new records",
+                    "type": "standard",
+                },
+                {
+                    "name": "copy",
+                    "description": "Duplicate a record",
+                    "type": "standard",
+                },
+                {
+                    "name": "onchange",
+                    "description": "Trigger onchange events",
+                    "type": "standard",
+                },
+                {
+                    "name": "check_access_rights",
+                    "description": "Check access rights",
+                    "type": "standard",
+                },
+            ]
+
+            return {
+                "model": model,
+                "methods": standard_methods,
+                "note": "This list contains standard Odoo methods. Custom methods defined in Python code are also callable via execute_method but cannot be listed via the API.",
+            }
+        except Exception as e:
+            logger.error(f"Error in list_model_methods tool: {e}")
+            sanitized_msg = ErrorSanitizer.sanitize_message(str(e))
+            raise ToolError(f"Failed to list methods: {sanitized_msg}") from e
 
 def register_tools(
     app: FastMCP,
