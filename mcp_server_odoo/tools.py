@@ -5,7 +5,9 @@ Tools are different from resources - they can have side effects and perform
 actions like creating, updating, or deleting records.
 """
 
+import base64
 import json
+import os
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Union
 
@@ -595,6 +597,53 @@ class OdooToolHandler:
                 Revenge plot string
             """
             return f"Successfully plotted revenge against {name}! 🗡️🔥"
+
+        @self.app.tool()
+        async def create_artifact(
+            name: str,
+            content: str,
+            file_type: str = "text/plain"
+        ) -> str:
+            """Create a file artifact in Odoo linked to the current conversation.
+            
+            Args:
+                name: The name of the file (e.g., "report.pdf", "data.xlsx")
+                content: The content of the file. For binary files (pdf, xlsx, etc.), this should be base64 encoded. For text files, it can be plain text.
+                file_type: The MIME type of the file (e.g., "application/pdf", "text/csv")
+            """
+            conversation_id = os.environ.get("ODOO_CONVERSATION_ID")
+            if not conversation_id:
+                return "Error: ODOO_CONVERSATION_ID environment variable not set. This tool can only be used within an AI conversation context."
+
+            # Check if content needs base64 encoding
+            b64_content = content
+            if "text" in file_type or file_type == "application/json":
+                 try:
+                     base64.b64decode(content, validate=True)
+                 except Exception:
+                     b64_content = base64.b64encode(content.encode('utf-8')).decode('utf-8')
+
+            vals = {
+                'name': name,
+                'datas': b64_content,
+                'mimetype': file_type,
+                'res_model': 'ai.conversation',
+                'res_id': int(conversation_id),
+                'type': 'binary',
+            }
+
+            try:
+                # We use execute_kw to create the attachment
+                # Note: We are using the connection's execute_kw which handles the XML-RPC call
+                attachment_id = self.connection.execute_kw(
+                    'ir.attachment', 
+                    'create', 
+                    [vals], 
+                    {}
+                )
+                return f"Artifact created successfully with ID: {attachment_id}"
+            except Exception as e:
+                return f"Error creating artifact: {str(e)}"
 
     async def _handle_search_tool(
         self,
