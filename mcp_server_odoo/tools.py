@@ -615,13 +615,27 @@ class OdooToolHandler:
             if not conversation_id:
                 return "Error: ODOO_CONVERSATION_ID environment variable not set. This tool can only be used within an AI conversation context."
 
+            # Ensure content is string
+            if not isinstance(content, str):
+                content = str(content)
+
             # Check if content needs base64 encoding
+            # We apply this check to ALL file types to handle cases where the LLM
+            # might send raw text for binary files (which needs encoding) 
+            # or base64 for text files (which needs to be kept as is).
             b64_content = content
-            if "text" in file_type or file_type == "application/json":
-                 try:
-                     base64.b64decode(content, validate=True)
-                 except Exception:
-                     b64_content = base64.b64encode(content.encode('utf-8')).decode('utf-8')
+            try:
+                # Remove whitespace for validation (base64 can have newlines)
+                clean_content = "".join(content.split())
+                if len(clean_content) == 0 or len(clean_content) % 4 != 0:
+                    raise ValueError
+                base64.b64decode(clean_content, validate=True)
+                # If valid base64, use the clean version
+                b64_content = clean_content
+            except Exception:
+                # If not valid base64, encode the original content
+                # This handles plain text, code, or "hallucinated" text content for binaries
+                b64_content = base64.b64encode(content.encode('utf-8')).decode('utf-8')
 
             vals = {
                 'name': name,
