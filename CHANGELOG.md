@@ -27,6 +27,10 @@ the one-line hook in `server.py` and the version.
 - `list_model_methods` (a fixed list naming methods Odoo 17+ no longer has)
 - `plot_revenge`
 
+### CI
+- The MCP-module integration jobs run only in upstream's repo: they need its
+  `MCP_MODULE_PAT` secret, and failed on the fork before any test ran.
+
 ## [0.9.0] - 2026-10-10
 
 ### Added

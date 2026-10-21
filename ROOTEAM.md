@@ -36,7 +36,11 @@ git merge upstream/main
 ```
 
 Conflicts should only come up in `server.py`, the version lines (`pyproject.toml`,
-`mcp_server_odoo/__init__.py`, `uv.lock`) and `CHANGELOG.md`. Set the version to
+`mcp_server_odoo/__init__.py`, `uv.lock`), `CHANGELOG.md`, and the `if:` of the
+`mcp-integration-test` job in `.github/workflows/ci.yml`. That job checks out a
+private module with upstream's `MCP_MODULE_PAT` secret, so the fork gates it to
+`ivnvxd/mcp-server-odoo` and it shows as skipped here. The YOLO integration jobs
+cover the mode Rooteam uses. Set the version to
 `<upstream version>+rooteam.<n>`, run `uv run pytest -m "not yolo and not mcp"`,
 then tag `v<upstream version>-rooteam.<n>`. Do not publish a GitHub Release: the
 Release event starts the PyPI and Docker workflows.

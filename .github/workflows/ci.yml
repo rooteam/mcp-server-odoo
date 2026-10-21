@@ -239,11 +239,13 @@ jobs:
     # (MCP_MODULE_PAT) are not available to either: forks never get them,
     # and Dependabot-triggered workflows read from the separate (empty)
     # Dependabot secrets store. Lint/unit/YOLO jobs still cover those PRs.
+    # Rooteam fork: MCP_MODULE_PAT exists only upstream, so skip everywhere else.
     if: |
-      (github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev'))
-      || (github.event_name == 'pull_request'
-          && github.event.pull_request.head.repo.full_name == github.repository
-          && github.actor != 'dependabot[bot]')
+      github.repository == 'ivnvxd/mcp-server-odoo'
+      && ((github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev'))
+          || (github.event_name == 'pull_request'
+              && github.event.pull_request.head.repo.full_name == github.repository
+              && github.actor != 'dependabot[bot]'))
     strategy:
       fail-fast: false
       matrix:
