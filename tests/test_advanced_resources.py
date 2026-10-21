@@ -5,13 +5,10 @@ from unittest.mock import Mock
 from urllib.parse import quote
 
 import pytest
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
-from mcp_server_odoo.access_control import AccessControlError, AccessController
+from mcp_server_odoo.access_control import AccessController
 from mcp_server_odoo.config import OdooConfig, load_config
-from mcp_server_odoo.error_handling import (
-    PermissionError as MCPPermissionError,
-)
 from mcp_server_odoo.error_handling import (
     ValidationError,
 )
@@ -31,11 +28,28 @@ def mock_config():
     return config
 
 
+def _realistic_fields_get():
+    """Realistic fields_get return value for testing safe-field filtering."""
+    return {
+        "id": {"type": "integer", "string": "ID"},
+        "name": {"type": "char", "string": "Name"},
+        "email": {"type": "char", "string": "Email"},
+        "is_company": {"type": "boolean", "string": "Is a Company"},
+        "phone": {"type": "char", "string": "Phone"},
+        "country_id": {"type": "many2one", "string": "Country", "relation": "res.country"},
+        # Fields that should be filtered out
+        "image_1920": {"type": "binary", "string": "Image"},
+        "website_description": {"type": "html", "string": "Website Description"},
+        "__last_update": {"type": "datetime", "string": "Last Modified on"},
+    }
+
+
 @pytest.fixture
 def mock_connection():
-    """Create a mock Odoo connection."""
+    """Create a mock Odoo connection with realistic field metadata."""
     conn = Mock(spec=OdooConnection)
     conn.is_authenticated = True
+    conn.fields_get = Mock(return_value=_realistic_fields_get())
     return conn
 
 
@@ -48,14 +62,14 @@ def mock_access_controller():
 
 @pytest.fixture
 def mock_app():
-    """Create a mock FastMCP app."""
-    app = Mock(spec=FastMCP)
+    """Create a mock MCPServer app."""
+    app = Mock(spec=MCPServer)
     app.resource = Mock()
 
     # Store registered handlers
     app._handlers = {}
 
-    def resource_decorator(uri_pattern):
+    def resource_decorator(uri_pattern, **kwargs):
         def decorator(func):
             app._handlers[uri_pattern] = func
             return func
@@ -70,109 +84,6 @@ def mock_app():
 def resource_handler(mock_app, mock_connection, mock_access_controller, mock_config):
     """Create a resource handler instance."""
     return OdooResourceHandler(mock_app, mock_connection, mock_access_controller, mock_config)
-
-
-class TestBrowseResource:
-    """Test browse resource functionality."""
-
-    @pytest.mark.asyncio
-    async def test_browse_multiple_records(
-        self, resource_handler, mock_connection, mock_access_controller
-    ):
-        """Test browsing multiple records by IDs."""
-        # Setup mocks
-        mock_access_controller.validate_model_access.return_value = None
-        mock_connection.read.return_value = [
-            {"id": 1, "name": "Record 1", "email": "r1@example.com"},
-            {"id": 3, "name": "Record 3", "email": "r3@example.com"},
-            {"id": 5, "name": "Record 5", "email": "r5@example.com"},
-        ]
-        mock_connection.fields_get.return_value = {
-            "name": {"type": "char", "string": "Name"},
-            "email": {"type": "char", "string": "Email"},
-        }
-
-        # Execute browse
-        result = await resource_handler._handle_browse("res.partner", "1,3,5")
-
-        # Verify calls
-        mock_access_controller.validate_model_access.assert_called_once_with("res.partner", "read")
-        # After smart field filtering, read is called with specific fields
-        mock_connection.read.assert_called_once_with("res.partner", [1, 3, 5], ["name", "email"])
-
-        # Check result format
-        assert "Browse Results: res.partner" in result
-        assert "Requested IDs: 1, 3, 5" in result
-        assert "Found: 3 of 3 records" in result
-        assert "Record 1" in result
-        assert "Record 3" in result
-        assert "Record 5" in result
-
-    @pytest.mark.asyncio
-    async def test_browse_with_missing_records(
-        self, resource_handler, mock_connection, mock_access_controller
-    ):
-        """Test browsing with some missing records."""
-        # Setup mocks
-        mock_access_controller.validate_model_access.return_value = None
-        mock_connection.read.return_value = [
-            {"id": 1, "name": "Record 1"},
-            {"id": 3, "name": "Record 3"},
-        ]
-        mock_connection.fields_get.return_value = {}
-
-        # Execute browse
-        result = await resource_handler._handle_browse("res.partner", "1,2,3,4")
-
-        # Check result shows missing records
-        assert "Requested IDs: 1, 2, 3, 4" in result
-        assert "Found: 2 of 4 records" in result
-        assert "Missing IDs: 2, 4" in result
-
-    @pytest.mark.asyncio
-    async def test_browse_invalid_ids(
-        self, resource_handler, mock_connection, mock_access_controller
-    ):
-        """Test browse with invalid ID formats."""
-        # Setup mocks
-        mock_access_controller.validate_model_access.return_value = None
-        mock_connection.read.return_value = [
-            {"id": 1, "name": "Record 1"},
-        ]
-        mock_connection.fields_get.return_value = {}
-
-        # Execute browse with mixed valid/invalid IDs
-        result = await resource_handler._handle_browse("res.partner", "1,abc,2.5,-3,0")
-
-        # Should only use valid ID (1)
-        mock_connection.read.assert_called_once_with("res.partner", [1])
-        assert "Record 1" in result
-
-    @pytest.mark.asyncio
-    async def test_browse_empty_ids(self, resource_handler, mock_access_controller):
-        """Test browse with empty ID list."""
-        # Setup mocks
-        mock_access_controller.validate_model_access.return_value = None
-
-        # Execute browse and expect error
-        with pytest.raises(ValidationError) as exc_info:
-            await resource_handler._handle_browse("res.partner", "")
-
-        assert "No valid IDs provided" in str(exc_info.value)
-
-    @pytest.mark.asyncio
-    async def test_browse_access_denied(self, resource_handler, mock_access_controller):
-        """Test browse with access denied."""
-        # Setup access denial
-        mock_access_controller.validate_model_access.side_effect = AccessControlError(
-            "Model 'sale.order' is not enabled for MCP access"
-        )
-
-        # Execute browse and expect permission error
-        with pytest.raises(MCPPermissionError) as exc_info:
-            await resource_handler._handle_browse("sale.order", "1,2,3")
-
-        assert "Access denied" in str(exc_info.value)
 
 
 class TestCountResource:
@@ -391,60 +302,96 @@ class TestFieldsResource:
         assert "Readonly: True" in result
 
 
+class TestFieldsEdgeCases:
+    """Test edge cases for fields resource."""
+
+    @pytest.mark.asyncio
+    async def test_fields_with_many_selections(
+        self, resource_handler, mock_connection, mock_access_controller
+    ):
+        """Test that selection fields with 6+ options show count instead of listing."""
+        mock_access_controller.validate_model_access.return_value = None
+        mock_connection.fields_get.return_value = {
+            "priority": {
+                "type": "selection",
+                "string": "Priority",
+                "selection": [
+                    ("0", "Normal"),
+                    ("1", "Low"),
+                    ("2", "Medium"),
+                    ("3", "High"),
+                    ("4", "Very High"),
+                    ("5", "Critical"),
+                ],
+            },
+        }
+
+        result = await resource_handler._handle_fields("project.task")
+
+        # With 6 options (>5), should show count instead of listing each option
+        assert "6 choices available" in result
+        # Should NOT list individual options
+        assert "Normal" not in result
+
+    @pytest.mark.asyncio
+    async def test_fields_connection_error(
+        self, resource_handler, mock_connection, mock_access_controller
+    ):
+        """Test that OdooConnectionError in fields_get is wrapped as ValidationError."""
+        from mcp_server_odoo.odoo_connection import OdooConnectionError
+
+        mock_access_controller.validate_model_access.return_value = None
+        mock_connection.fields_get.side_effect = OdooConnectionError("Server unreachable")
+
+        with pytest.raises(ValidationError) as exc_info:
+            await resource_handler._handle_fields("res.partner")
+
+        assert "Connection error" in str(exc_info.value)
+        assert "Server unreachable" in str(exc_info.value)
+
+
+class TestCountNotAuthenticated:
+    """Test count resource when not authenticated."""
+
+    @pytest.mark.asyncio
+    async def test_count_not_authenticated(self, resource_handler, mock_connection):
+        """Test that _handle_count raises ValidationError when not authenticated."""
+        mock_connection.is_authenticated = False
+
+        with pytest.raises(ValidationError) as exc_info:
+            await resource_handler._handle_count("res.partner", None)
+
+        assert "Not authenticated with Odoo" in str(exc_info.value)
+
+
+class TestFieldsNotAuthenticated:
+    """Test fields resource when not authenticated."""
+
+    @pytest.mark.asyncio
+    async def test_fields_not_authenticated(self, resource_handler, mock_connection):
+        """Test that _handle_fields raises ValidationError when not authenticated."""
+        mock_connection.is_authenticated = False
+
+        with pytest.raises(ValidationError) as exc_info:
+            await resource_handler._handle_fields("res.partner")
+
+        assert "Not authenticated with Odoo" in str(exc_info.value)
+
+
 class TestAdvancedResourceIntegration:
     """Integration tests for advanced resources with real Odoo."""
 
     @pytest.mark.asyncio
-    @pytest.mark.integration
-    @skip_on_rate_limit
-    async def test_browse_real_records(self, real_config, real_connection):
-        """Test browse with real Odoo connection."""
-        # Setup real components
-        app = Mock(spec=FastMCP)
-        app.resource = Mock()
-        app._handlers = {}
-
-        def resource_decorator(uri_pattern):
-            def decorator(func):
-                app._handlers[uri_pattern] = func
-                return func
-
-            return decorator
-
-        app.resource.side_effect = resource_decorator
-
-        access_controller = AccessController(real_config)
-        handler = OdooResourceHandler(app, real_connection, access_controller, real_config)
-
-        # Authenticate
-        real_connection.connect()
-        real_connection.authenticate()
-
-        # Get some partner IDs to browse
-        partner_ids = real_connection.search("res.partner", [], limit=3)
-
-        if partner_ids:
-            # Execute real browse
-            ids_str = ",".join(map(str, partner_ids))
-            result = await handler._handle_browse("res.partner", ids_str)
-
-            # Verify result
-            assert "Browse Results: res.partner" in result
-            assert f"Found: {len(partner_ids)} of {len(partner_ids)} records" in result
-            for pid in partner_ids:
-                assert str(pid) in result
-
-    @pytest.mark.asyncio
-    @pytest.mark.integration
+    @pytest.mark.mcp
     @skip_on_rate_limit
     async def test_count_real_records(self, real_config, real_connection):
         """Test count with real Odoo connection."""
         # Setup real components
-        app = Mock(spec=FastMCP)
+        app = Mock(spec=MCPServer)
         app.resource = Mock()
         app._handlers = {}
 
-        def resource_decorator(uri_pattern):
+        def resource_decorator(uri_pattern, **kwargs):
             def decorator(func):
                 app._handlers[uri_pattern] = func
                 return func
@@ -472,16 +419,16 @@ class TestAdvancedResourceIntegration:
         assert "Total count:" in result_companies
 
     @pytest.mark.asyncio
-    @pytest.mark.integration
+    @pytest.mark.mcp
     @skip_on_rate_limit
     async def test_fields_real_model(self, real_config, real_connection):
         """Test fields with real Odoo model."""
         # Setup real components
-        app = Mock(spec=FastMCP)
+        app = Mock(spec=MCPServer)
         app.resource = Mock()
         app._handlers = {}
 
-        def resource_decorator(uri_pattern):
+        def resource_decorator(uri_pattern, **kwargs):
             def decorator(func):
                 app._handlers[uri_pattern] = func
                 return func

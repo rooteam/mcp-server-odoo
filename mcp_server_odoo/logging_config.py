@@ -14,7 +14,7 @@ import os
 import sys
 import time
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 # Default log format
@@ -27,9 +27,8 @@ class StructuredFormatter(logging.Formatter):
 
     def format(self, record: logging.LogRecord) -> str:
         """Format log record as JSON."""
-        # Base log data
-        log_data = {
-            "timestamp": datetime.utcnow().isoformat(),
+        log_data: Dict[str, Any] = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
             "logger": record.name,
             "level": record.levelname,
             "message": record.getMessage(),
@@ -38,7 +37,6 @@ class StructuredFormatter(logging.Formatter):
             "line": record.lineno,
         }
 
-        # Add extra fields if present
         if hasattr(record, "error_code"):
             log_data["error_code"] = record.error_code
         if hasattr(record, "error_details"):
@@ -54,7 +52,6 @@ class StructuredFormatter(logging.Formatter):
         if hasattr(record, "operation"):
             log_data["operation"] = record.operation
 
-        # Add exception info if present
         if record.exc_info:
             log_data["exception"] = self.formatException(record.exc_info)
 
@@ -64,7 +61,7 @@ class StructuredFormatter(logging.Formatter):
 class RequestLoggingAdapter(logging.LoggerAdapter):
     """Logging adapter that adds request context to log records."""
 
-    def __init__(self, logger: logging.Logger, request_id: str = None):
+    def __init__(self, logger: logging.Logger, request_id: str | None = None):
         """Initialize adapter with request ID."""
         self.request_id = request_id or self._generate_request_id()
         super().__init__(logger, {"request_id": self.request_id})
@@ -130,7 +127,7 @@ class PerformanceLogger:
             )
 
             # Log warning for slow operations
-            if duration_ms > 1000:  # More than 1 second
+            if duration_ms > logging_config.slow_operation_threshold_ms:
                 self.logger.warning(
                     f"Slow operation detected: '{operation}' took {duration_ms:.2f}ms",
                     extra=log_data,
@@ -151,22 +148,17 @@ def setup_logging(
         use_json: Whether to use JSON formatting
         log_file: Optional log file path
     """
-    # Get log level from environment or parameter
     if log_level is None:
         log_level = os.getenv("ODOO_MCP_LOG_LEVEL", "INFO")
 
-    # Convert to logging level
     numeric_level = getattr(logging, log_level.upper(), logging.INFO)
 
-    # Get root logger
     root_logger = logging.getLogger()
     root_logger.setLevel(numeric_level)
 
-    # Remove existing handlers
     for handler in root_logger.handlers[:]:
         root_logger.removeHandler(handler)
 
-    # Create formatter
     if use_json or os.getenv("ODOO_MCP_LOG_JSON", "").lower() == "true":
         formatter = StructuredFormatter()
     else:
@@ -199,7 +191,9 @@ def setup_logging(
     logging.getLogger("asyncio").setLevel(logging.WARNING)
 
 
-def get_logger(name: str, request_id: Optional[str] = None) -> logging.Logger:
+def get_logger(
+    name: str, request_id: Optional[str] = None
+) -> logging.Logger | logging.LoggerAdapter:
     """Get a logger instance with optional request context.
 
     Args:
@@ -233,7 +227,7 @@ def log_request(
         params: Query parameters
         body: Request body
     """
-    log_data = {
+    log_data: Dict[str, Any] = {
         "request_method": method,
         "request_path": path,
     }
@@ -241,7 +235,6 @@ def log_request(
     if params:
         log_data["request_params"] = params
 
-    # Limit body size in logs
     if body:
         body_str = str(body)
         if len(body_str) > 1000:
@@ -283,24 +276,58 @@ def log_response(
 
 
 class LoggingConfig:
-    """Configuration class for logging settings."""
+    """Configuration class for logging settings.
 
-    def __init__(self):
-        """Initialize logging configuration from environment."""
-        self.log_level = os.getenv("ODOO_MCP_LOG_LEVEL", "INFO")
-        self.log_format = os.getenv("ODOO_MCP_LOG_FORMAT", DEFAULT_FORMAT)
-        self.use_json = os.getenv("ODOO_MCP_LOG_JSON", "false").lower() == "true"
-        self.log_file = os.getenv("ODOO_MCP_LOG_FILE")
-        self.log_request_body = os.getenv("ODOO_MCP_LOG_REQUEST_BODY", "false").lower() == "true"
-        self.log_response_body = os.getenv("ODOO_MCP_LOG_RESPONSE_BODY", "false").lower() == "true"
-        self.slow_operation_threshold_ms = int(
-            os.getenv("ODOO_MCP_SLOW_OPERATION_THRESHOLD_MS", "1000")
-        )
+    Reads the environment at ACCESS time, not import time: the
+    module-level singleton below is created on package import, BEFORE
+    load_config() loads the .env file — snapshotting in __init__ would
+    silently ignore any ODOO_MCP_LOG_* values set only in .env.
+    """
 
-    def setup(self):
-        """Set up logging with current configuration."""
+    @property
+    def log_level(self) -> str:
+        return os.getenv("ODOO_MCP_LOG_LEVEL", "INFO")
+
+    @property
+    def log_format(self) -> str:
+        return os.getenv("ODOO_MCP_LOG_FORMAT", DEFAULT_FORMAT)
+
+    @property
+    def use_json(self) -> bool:
+        return os.getenv("ODOO_MCP_LOG_JSON", "false").lower() == "true"
+
+    @property
+    def log_file(self) -> Optional[str]:
+        return os.getenv("ODOO_MCP_LOG_FILE")
+
+    @property
+    def log_request_body(self) -> bool:
+        return os.getenv("ODOO_MCP_LOG_REQUEST_BODY", "false").lower() == "true"
+
+    @property
+    def log_response_body(self) -> bool:
+        return os.getenv("ODOO_MCP_LOG_RESPONSE_BODY", "false").lower() == "true"
+
+    @property
+    def slow_operation_threshold_ms(self) -> int:
+        raw = os.getenv("ODOO_MCP_SLOW_OPERATION_THRESHOLD_MS", "1000")
+        try:
+            return int(raw)
+        except ValueError:
+            logging.getLogger(__name__).warning(
+                f"Invalid ODOO_MCP_SLOW_OPERATION_THRESHOLD_MS value '{raw}', using 1000"
+            )
+            return 1000
+
+    def setup(self, log_level: Optional[str] = None):
+        """Set up logging with current configuration.
+
+        Args:
+            log_level: Explicit level (e.g. the validated OdooConfig.log_level);
+                falls back to ODOO_MCP_LOG_LEVEL / INFO.
+        """
         setup_logging(
-            log_level=self.log_level,
+            log_level=log_level or self.log_level,
             log_format=self.log_format,
             use_json=self.use_json,
             log_file=self.log_file,

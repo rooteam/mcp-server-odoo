@@ -4,14 +4,23 @@ These tests use a real Odoo server at localhost:8069 to test
 connection management and error handling.
 """
 
+import http.client
 import os
 import socket
-from unittest.mock import MagicMock, patch
+import urllib.error
+import xmlrpc.client
+from unittest.mock import MagicMock, Mock, patch
 
 import pytest
 
 from mcp_server_odoo.config import OdooConfig
-from mcp_server_odoo.odoo_connection import OdooConnection, OdooConnectionError, create_connection
+from mcp_server_odoo.odoo_connection import (
+    OdooConnection,
+    OdooConnectionError,
+    OdooUnreachableError,
+    create_connection,
+)
+from mcp_server_odoo.odoo_errors import is_unreachable
 
 
 @pytest.fixture
@@ -19,11 +28,16 @@ def test_config():
     """Create test configuration."""
     return OdooConfig(
         url=os.getenv("ODOO_URL", "http://localhost:8069"),
-        api_key="test_api_key",
-        database=os.getenv("ODOO_DB"),
+        api_key=os.getenv("ODOO_API_KEY") or None,
+        username=os.getenv("ODOO_USER", "admin"),
+        password=os.getenv("ODOO_PASSWORD", "admin"),
+        database=os.getenv("ODOO_DB") or "odoo",
         log_level="INFO",
         default_limit=10,
         max_limit=100,
+        yolo_mode=os.getenv("ODOO_YOLO", "off"),
+        # These tests check the XML-RPC proxies; "auto" takes JSON-2 on Odoo 19+
+        rpc_transport="xmlrpc",
     )
 
 
@@ -33,7 +47,7 @@ def invalid_config():
     return OdooConfig(
         url="http://invalid.host.nowhere:9999",
         api_key="test_api_key",
-        database=os.getenv("ODOO_DB"),
+        database=os.getenv("ODOO_DB") or "odoo",
         log_level="INFO",
         default_limit=10,
         max_limit=100,
@@ -120,10 +134,78 @@ class TestOdooConnectionInit:
         assert object_url == expected_object_url
 
 
+class TestBuildRecordUrl:
+    """Test version-aware record URL generation."""
+
+    def test_legacy_url_for_odoo_17(self, test_config):
+        """Odoo <= 17 should use /web# hash format."""
+        conn = OdooConnection(test_config)
+        conn._server_version = "17.0"
+        url = conn.build_record_url("res.partner", 42)
+        base = test_config.url.rstrip("/")
+        assert url == f"{base}/web#id=42&model=res.partner&view_type=form"
+
+    def test_legacy_url_for_odoo_16(self, test_config):
+        """Odoo 16 should use /web# hash format."""
+        conn = OdooConnection(test_config)
+        conn._server_version = "16.0"
+        url = conn.build_record_url("res.partner", 42)
+        base = test_config.url.rstrip("/")
+        assert url == f"{base}/web#id=42&model=res.partner&view_type=form"
+
+    def test_modern_url_for_odoo_18(self, test_config):
+        """Odoo 18+ should use /odoo/ path format."""
+        conn = OdooConnection(test_config)
+        conn._server_version = "18.0"
+        url = conn.build_record_url("res.partner", 42)
+        base = test_config.url.rstrip("/")
+        assert url == f"{base}/odoo/res.partner/42"
+
+    def test_modern_url_for_odoo_19(self, test_config):
+        """Odoo 19 should use /odoo/ path format."""
+        conn = OdooConnection(test_config)
+        conn._server_version = "19.0"
+        url = conn.build_record_url("sale.order", 7)
+        base = test_config.url.rstrip("/")
+        assert url == f"{base}/odoo/sale.order/7"
+
+    def test_fallback_when_version_unknown(self, test_config):
+        """Unknown version should fall back to legacy format."""
+        conn = OdooConnection(test_config)
+        conn._server_version = None
+        url = conn.build_record_url("res.partner", 42)
+        base = test_config.url.rstrip("/")
+        assert url == f"{base}/web#id=42&model=res.partner&view_type=form"
+
+    def test_saas_version_18(self, test_config):
+        """SaaS version based on Odoo 18 should use modern format."""
+        conn = OdooConnection(test_config)
+        conn._server_version = "saas~18.1"
+        url = conn.build_record_url("res.partner", 42)
+        base = test_config.url.rstrip("/")
+        assert url == f"{base}/odoo/res.partner/42"
+
+    def test_saas_version_17(self, test_config):
+        """SaaS version based on Odoo 17 should use legacy format."""
+        conn = OdooConnection(test_config)
+        conn._server_version = "saas~17.4"
+        url = conn.build_record_url("res.partner", 42)
+        base = test_config.url.rstrip("/")
+        assert url == f"{base}/web#id=42&model=res.partner&view_type=form"
+
+    def test_fallback_when_version_malformed(self, test_config):
+        """Completely malformed version string should fall back to legacy format."""
+        conn = OdooConnection(test_config)
+        conn._server_version = "unknown"
+        url = conn.build_record_url("res.partner", 42)
+        base = test_config.url.rstrip("/")
+        assert url == f"{base}/web#id=42&model=res.partner&view_type=form"
+
+
 class TestOdooConnectionConnect:
     """Test connection establishment."""
 
-    @pytest.mark.odoo_required
+    @pytest.mark.yolo
     def test_connect_success(self, test_config):
         """Test successful connection to real Odoo server."""
         conn = OdooConnection(test_config)
@@ -137,7 +219,7 @@ class TestOdooConnectionConnect:
         finally:
             conn.disconnect()
 
-    @pytest.mark.odoo_required
+    @pytest.mark.yolo
     def test_connect_already_connected(self, test_config, caplog):
         """Test connecting when already connected."""
         conn = OdooConnection(test_config)
@@ -156,10 +238,11 @@ class TestOdooConnectionConnect:
         """Test connection to invalid host."""
         conn = OdooConnection(invalid_config)
 
-        with pytest.raises(OdooConnectionError) as exc_info:
+        with pytest.raises(OdooUnreachableError) as exc_info:
             conn.connect()
 
-        assert "Connection failed" in str(exc_info.value)
+        error_msg = str(exc_info.value)
+        assert "Cannot reach Odoo" in error_msg
 
     def test_connect_timeout(self, test_config):
         """Test connection timeout handling."""
@@ -170,16 +253,17 @@ class TestOdooConnectionConnect:
         with patch("socket.socket") as mock_socket:
             mock_socket.side_effect = socket.timeout("Timeout")
 
-            with pytest.raises(OdooConnectionError) as exc_info:
+            with pytest.raises(OdooUnreachableError) as exc_info:
                 conn.connect()
 
-            assert "Connection failed" in str(exc_info.value)
+            error_msg = str(exc_info.value)
+            assert "Cannot reach Odoo" in error_msg
 
 
 class TestOdooConnectionDisconnect:
     """Test connection cleanup."""
 
-    @pytest.mark.odoo_required
+    @pytest.mark.yolo
     def test_disconnect_when_connected(self, test_config):
         """Test normal disconnect."""
         conn = OdooConnection(test_config)
@@ -200,20 +284,11 @@ class TestOdooConnectionDisconnect:
         conn.disconnect()
         assert "Not connected to Odoo" in caplog.text
 
-    @pytest.mark.odoo_required
-    def test_disconnect_cleanup_on_del(self, test_config):
-        """Test cleanup on object deletion."""
-        conn = OdooConnection(test_config)
-        conn.connect()
-
-        # Delete should trigger disconnect
-        del conn
-
 
 class TestOdooConnectionHealth:
     """Test health checking."""
 
-    @pytest.mark.odoo_required
+    @pytest.mark.yolo
     def test_check_health_connected(self, test_config):
         """Test health check when connected."""
         conn = OdooConnection(test_config)
@@ -236,7 +311,7 @@ class TestOdooConnectionHealth:
         assert not is_healthy
         assert message == "Not connected"
 
-    @pytest.mark.odoo_required
+    @pytest.mark.yolo
     def test_check_health_error(self, test_config):
         """Test health check with connection error."""
         conn = OdooConnection(test_config)
@@ -253,11 +328,23 @@ class TestOdooConnectionHealth:
 
         conn.disconnect()
 
+    def test_check_health_timeout(self, test_config):
+        """Test health check returns failure tuple on socket timeout."""
+        conn = OdooConnection(test_config)
+        conn._connected = True
+        conn._common_proxy = MagicMock()
+        conn._common_proxy.version.side_effect = socket.timeout("timed out")
+
+        is_healthy, message = conn.check_health()
+
+        assert is_healthy is False
+        assert "Health check timeout" in message
+
 
 class TestOdooConnectionProxies:
     """Test proxy access."""
 
-    @pytest.mark.odoo_required
+    @pytest.mark.yolo
     def test_proxy_access_when_connected(self, test_config):
         """Test accessing proxies when connected."""
         conn = OdooConnection(test_config)
@@ -293,7 +380,7 @@ class TestOdooConnectionProxies:
 class TestOdooConnectionContext:
     """Test context manager functionality."""
 
-    @pytest.mark.odoo_required
+    @pytest.mark.yolo
     def test_context_manager_success(self, test_config):
         """Test using connection as context manager."""
         with OdooConnection(test_config) as conn:
@@ -306,7 +393,7 @@ class TestOdooConnectionContext:
         # Should be disconnected after context
         assert not conn.is_connected
 
-    @pytest.mark.odoo_required
+    @pytest.mark.yolo
     def test_context_manager_with_error(self, test_config):
         """Test context manager with error in context."""
         conn = OdooConnection(test_config)
@@ -321,7 +408,7 @@ class TestOdooConnectionContext:
         # Should still be disconnected
         assert not conn.is_connected
 
-    @pytest.mark.odoo_required
+    @pytest.mark.yolo
     def test_create_connection_helper(self, test_config):
         """Test create_connection helper function."""
         with create_connection(test_config) as conn:
@@ -334,7 +421,7 @@ class TestOdooConnectionContext:
 class TestOdooConnectionIntegration:
     """Integration tests with real Odoo server."""
 
-    @pytest.mark.integration
+    @pytest.mark.yolo
     def test_real_server_version(self, test_config):
         """Test getting version from real server."""
         with create_connection(test_config) as conn:
@@ -344,14 +431,129 @@ class TestOdooConnectionIntegration:
             assert "server_version" in version
             assert "protocol_version" in version
 
-    @pytest.mark.integration
+    @pytest.mark.yolo
     def test_real_server_db_list(self, test_config):
         """Test listing databases from real server."""
         with create_connection(test_config) as conn:
-            # Note: This might fail if db listing is disabled
             try:
-                db_list = conn.db_proxy.list()
-                assert isinstance(db_list, list)
-            except Exception as e:
-                # DB listing might be disabled for security
-                assert "Access Denied" in str(e) or "not allowed" in str(e)
+                db_list = conn.list_databases()
+            except OdooConnectionError as e:
+                if "Cannot list databases" in str(e):
+                    pytest.skip("Database listing is disabled on this server")
+                raise
+            assert isinstance(db_list, list)
+            assert len(db_list) > 0
+
+
+class TestSensitiveValueRedaction:
+    """Write payload values must never reach log output in cleartext."""
+
+    def test_password_redacted_in_debug_log(self, caplog):
+        import logging
+
+        from mcp_server_odoo.config import OdooConfig
+        from mcp_server_odoo.odoo_connection import OdooConnection
+
+        config = OdooConfig(
+            url="http://localhost:8069",
+            username="admin",
+            password="admin",
+            database="testdb",
+        )
+        conn = OdooConnection(config)
+        conn._connected = True
+        conn._authenticated = True
+        conn._uid = 2
+        conn._database = "testdb"
+        conn._auth_method = "password"
+        conn._object_proxy = MagicMock()
+        conn._object_proxy.execute_kw.return_value = 42
+
+        with caplog.at_level(logging.DEBUG, logger="mcp_server_odoo.odoo_connection"):
+            conn.create(
+                "res.users",
+                {"name": "Bob", "login": "bob", "password": "S3cretPass!"},
+            )
+
+        assert "S3cretPass!" not in caplog.text
+        assert "***" in caplog.text
+        assert "Bob" in caplog.text  # non-sensitive values still visible
+
+    def test_long_strings_summarized(self):
+        from mcp_server_odoo.odoo_connection import _describe_args
+
+        blob = "A" * 5000
+        described = _describe_args([{"image_1920": blob, "name": "x"}])
+        assert described[0]["image_1920"] == "<str len=5000>"
+        assert described[0]["name"] == "x"
+
+
+class TestUnreachableClassification:
+    """Odoo not answering (network, gateway) is told apart from a refusal.
+
+    The server keeps running while Odoo is unreachable and retries on the next
+    request, but stops at startup on configuration and authentication errors.
+    """
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            ConnectionRefusedError(61, "Connection refused"),
+            socket.timeout("timed out"),
+            urllib.error.URLError(ConnectionRefusedError(61, "refused")),
+            urllib.error.HTTPError("http://odoo", 502, "Bad Gateway", {}, None),
+            xmlrpc.client.ProtocolError("odoo/xmlrpc", 503, "Service Unavailable", {}),
+            http.client.RemoteDisconnected("closed"),
+        ],
+    )
+    def test_network_and_gateway_errors_are_unreachable(self, error):
+        assert is_unreachable(error) is True
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            urllib.error.HTTPError("http://odoo", 403, "Forbidden", {}, None),
+            xmlrpc.client.ProtocolError("odoo/xmlrpc", 404, "Not Found", {}),
+            xmlrpc.client.Fault(3, "Access Denied"),
+            ValueError("bad"),
+        ],
+    )
+    def test_refusals_are_not_unreachable(self, error):
+        assert is_unreachable(error) is False
+
+    def test_connect_raises_unreachable_when_odoo_does_not_answer(self):
+        config = OdooConfig(url="http://odoo.test:8069", api_key="k", database="db")
+        conn = OdooConnection(config)
+        common = Mock()
+        common.version.side_effect = ConnectionRefusedError(61, "Connection refused")
+        with patch.object(
+            conn._performance_manager, "get_optimized_connection", return_value=common
+        ):
+            with pytest.raises(OdooUnreachableError, match="Cannot reach Odoo"):
+                conn.connect()
+
+    def test_listing_with_both_routes_unreachable_is_unreachable(self):
+        config = OdooConfig(url="http://odoo.test:8069", api_key="k", database=None)
+        conn = OdooConnection(config)
+        conn._connected = True
+        conn._db_proxy = Mock()
+        conn._db_proxy.list.side_effect = ConnectionRefusedError(61, "Connection refused")
+        with patch(
+            "urllib.request.urlopen",
+            side_effect=urllib.error.URLError(ConnectionRefusedError(61, "refused")),
+        ):
+            with pytest.raises(OdooUnreachableError):
+                conn.list_databases()
+
+    def test_disabled_listing_stays_a_configuration_error(self):
+        config = OdooConfig(url="http://odoo.test:8069", api_key="k", database=None)
+        conn = OdooConnection(config)
+        conn._connected = True
+        conn._db_proxy = Mock()
+        conn._db_proxy.list.side_effect = xmlrpc.client.Fault(1, "Invalid service name: db")
+        not_found = urllib.error.HTTPError("http://odoo.test", 404, "Not Found", {}, None)
+        with patch("urllib.request.urlopen", side_effect=not_found):
+            with pytest.raises(OdooConnectionError) as exc_info:
+                conn.list_databases()
+        assert not isinstance(exc_info.value, OdooUnreachableError)
+        assert "Set ODOO_DB" in str(exc_info.value)

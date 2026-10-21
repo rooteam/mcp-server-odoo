@@ -5,6 +5,318 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [0.9.0+rooteam.1] - 2026-10-21
+
+Rooteam fork, synced with upstream 0.9.0. The Rooteam tools live in
+`mcp_server_odoo/rooteam_tools.py`; upstream files are unchanged except for
+the one-line hook in `server.py` and the version.
+
+### Changed
+- `execute_method` now runs through upstream's `call_model_method` handler:
+  JSON-2 on Odoo 19 and later, refusal of `ir.actions.*`/`ir.cron`, `run`,
+  `method_direct_trigger`, `web_*` and ORM primitives (use the dedicated
+  tools), and list results truncated to 100 items. It stays on by default
+  and is skipped when `ODOO_MCP_ENABLE_METHOD_CALLS=true` registers
+  upstream's `call_model_method` instead.
+- `create_artifact` reports errors as tool errors instead of plain text and
+  writes `raw` on Odoo 20.
+
+### Removed
+- `list_model_methods` (a fixed list naming methods Odoo 17+ no longer has)
+- `plot_revenge`
+
+## [0.9.0] - 2026-10-10
+
+### Added
+- **JSON-2 transport**: in YOLO mode with an API key, the server talks to Odoo 19 and later through the JSON-2 API (`/json/2`) instead of the deprecated XML-RPC, and falls back to XML-RPC when JSON-2 is not available. `ODOO_RPC_TRANSPORT` (`auto`, `xmlrpc`, `json2`) overrides the choice, and `/health` shows it. `ODOO_USER` is not needed over JSON-2. If Odoo refuses the API key and `ODOO_USER` and `ODOO_PASSWORD` are set, `auto` falls back to them over XML-RPC, as the XML-RPC path does. A JSON-2 timeout counts as Odoo being unreachable, so the server keeps running.
+- **Per-call `context`**: the read and write tools take a `context` with `allowed_company_ids`, `lang`, `tz` and `active_test`, so company-dependent fields such as `standard_price` can be read and written per company. Other keys are refused by name, and a `lang` that Odoo has not installed is refused instead of dropped. On Odoo 16 and 17 in standard mode, that check needs `res.partner` or `res.lang` enabled for MCP; without either, only `en_US` is accepted (#129, @lucianosanchez-ui).
+- **`ODOO_ALLOWED_COMPANIES`**: limits every call to the listed companies of a multi-company database. The first one is the active company. At startup the server makes sure that each ID is one of the user's companies (#107, @jflaflamme).
+- **Usage guidance in the instructions**: the `initialize` instructions tell the model which tool to use for discovery, reads, counts, bulk writes and files, and to read many records in one `search_records` call. Only registered tools are named.
+- **`read_attachment` tool**: returns a file's text, the text Odoo extracted from a PDF or Office file, an image block for PNG, JPEG, GIF and WebP images up to 256 KB, or a download link. It takes an `odoo://` URI or an attachment ID.
+- **`list_record_attachments` tool**: lists the files attached to a record, newest first, each with its `odoo://attachment/{id}` URI.
+- **`upload_attachment` tool**: attaches a base64 file of up to about 2.9 MB to a record, and returns its `odoo://attachment/{id}` URI.
+- **`update_records` with per-record values**: `updates=[{"id": ..., "values": {...}}]` writes different values to each record in one transaction, on Odoo 19 and later.
+- **`create_records` tool**: creates up to 100 records of one model in one `create` call. It is one transaction, so either every record is created or none.
+- **`update_records` tool**: bulk-update multiple records of the same model with the same values in one call, instead of looping `update_record`. Capped at 100 distinct record IDs per call; fails the whole batch (no partial write) if any id doesn't exist. Archived records can be updated.
+- **Odoo 16 to 20 in CI**: the YOLO and MCP integration tests run on Odoo 16, 17, 18, 19 and 20. The MCP checks are named "(Odoo N)"; the YOLO checks are named "(Odoo N, <transport>)" and run over both JSON-2 and XML-RPC on 19 and 20. The MCP job uses the module branch of each version. A leg fails when Odoo or `/mcp/health` does not answer: the Odoo 20 YOLO leg had skipped every test, because Odoo 20 listens on 127.0.0.1 by default. The README documents the `rpc` scope that Odoo 20 requires for API keys, and the MCP User group.
+- **CI on pull requests to any branch**: the trigger matched only branch names without a `/`, so pull requests against `release/*` ran no CI.
+
+### Changed
+- **Permission cache documented**: in standard mode a permission granted in Odoo can take up to 5 minutes to reach the server. README and `.env.example` say so.
+- **JSON-2 by default on Odoo 19 and later**: YOLO setups with an API key switch from XML-RPC to JSON-2. There `call_model_method` takes only the record IDs in `arguments`; pass every other argument in `keyword_arguments`. `ODOO_RPC_TRANSPORT=xmlrpc` keeps XML-RPC.
+- **Default search limit is 25**: `search_records`, `aggregate_records` and the search resource return 25 records by default instead of 10. Set `ODOO_MCP_DEFAULT_LIMIT=10` to keep the old behavior.
+- **Stricter tool input**: a tool refuses arguments it does not take, and names them. Before, a misspelled argument such as `limt` was dropped and the call ran with the defaults. A record ID of `true` or `false` is refused instead of read as 1 or 0. A many2one value must be a record id or `false`: the `[id, name]` pair that a read returns is refused with a hint, where Odoo 16 to 18 failed with a database error and Odoo 19 emptied the field.
+- **Smart default fields**: a read without `fields` always includes `parent_id` when the model has one, so the contacts of a company can be told apart, and price fields such as `list_price` rank higher.
+- **`get_fields` default view**: without `field_names`, it returns the 60 most relevant value fields, many2one included, plus every one2many, many2many, file and HTML field, with selection lists cut at 20 values. Pass `["__all__"]` for every field.
+- **mcp 2.x**: the server runs on `mcp>=2.2,<3` and no longer depends on `pydantic-settings`. `serverInfo.version` reports the package version instead of the SDK version. Over HTTP, the SDK refuses request bodies over 4 MiB with 413, and holds at most 10,000 open sessions.
+- **Odoo unreachable at startup**: the server keeps running, `/health` reports unhealthy, and the next request connects. A configuration or authentication error still stops startup.
+- **Tool step messages**: they go to the server log only. mcp 2.x deprecates log notifications to the client.
+
+### Fixed
+- **`--help`**: lists `ODOO_MCP_LOG_FORMAT` and `ODOO_MCP_SLOW_OPERATION_THRESHOLD_MS`, as README and `.env.example` do.
+- **Nested writes in standard mode**: x2many commands in `values` are checked against the allowlist of the related model. A write on an allowed model can no longer create, change or delete records of a refused one, nor an attachment or message that belongs to one.
+- **Attachment writes in standard mode**: creating, changing, moving or deleting an attachment needs write access on the model that it belongs to, as `upload_attachment` already did.
+- **Reads through relations in standard mode**: a condition, `any` sub-domain, `order` or grouping that passes through a relation needs read access on the related model. A filter on `user_ids.groups_id.name` could test the values of a model that is not enabled.
+- **A model that is not installed**: the error no longer starts with "Access denied".
+- **Messages in standard mode**: `mail.message`, `mail.mail`, `mail.followers`, `mail.activity`, `mail.tracking.value` and `mail.notification` are limited to enabled models, as attachments are, in the tools and the resources.
+- **Requests while Odoo is down**: they return the connection error as the tool or resource error, without a traceback in the log for each call. The JSON-2 messages no longer repeat "Cannot connect to Odoo", and a refused API key mentions the `rpc` scope that Odoo 20 needs.
+- **`any` and `not any` on Odoo 16**: Odoo 16 failed such a domain with "unhashable type: 'list'", shown as a connection error. `search_records` and `aggregate_records` now refuse it with a clear message that suggests a dotted path.
+- **Empty total on Odoo 16**: `aggregate_records` without a `groupby` on a domain that matched nothing failed with "'NoneType' object is not iterable". It returns a row with `__count` 0.
+- **`aggregate_records` count on Odoo 16 to 18**: a count without other aggregates sent `read_group` an empty field list. Odoo 16 then failed without a `groupby`, and aggregated every numeric field with one.
+- **Typed tool schemas**: `domain`, `fields`, `arguments` and `keyword_arguments` had an untyped or multi-type schema, which Gemini, VS Code and other strict clients reject. They now have a typed schema, and the tools still accept the same input, strings included, but the descriptions no longer offer the string form. A value that was JSON-encoded twice is refused with a hint. `groupby` and `aggregates` also take a bare string, and `post_message` takes `subtype` and `message_type` in any letter case.
+- **`aggregate_records` with a function that does not fit the field**: `name:sum` reached SQL and came back as a generic connection error. `sum` and `avg` now need a number field, and `bool_and` and `bool_or` need a boolean field.
+- **Object reprs in `json` fields**: a value Odoo could not encode, such as `<function validate at 0x7f...>`, reads as `null` in `get_record`, `search_records` and the record and search resources.
+- **Unreadable fields in bulk reads**: a `get_record` or `search_records` read with smart defaults or `["__all__"]` failed as a whole when Odoo refused one field to the user, for example the accounting fields on a contact. Such fields are left out and listed in `skipped_fields`. An explicit field list still fails.
+- **Database auto-selection on Odoo 20**: databases are listed through `/web/database/list`, with `/xmlrpc/db` as the fallback. Odoo 20 removed the `db` RPC service. If both fail, the error asks for `ODOO_DB`.
+- **Binary fields on Odoo 20**: `get_record` and `search_records` returned populated binaries as inline base64, because Odoo 20 dropped `bin_size`. Binaries now stay out of the read, and a search per stored binary field finds the populated records. Non-stored binaries such as `avatar_128` always get their URI.
+- **Binary resources on Odoo 20**: the `ODOO_MCP_MAX_BINARY_SIZE` check runs before the fetch again. It reads the `file_size` of the backing attachment, or uses `field.size` for a plain column. The record and search resources no longer pull binary payloads.
+- **Attachments on Odoo 20**: Odoo 20 removed `ir.attachment.datas`, so every `odoo://attachment/{id}` read failed. The attachment resource reads `raw` on Odoo 20. `raw` and `db_datas` get the attachment URI in tool results, as `datas` does.
+- **MCP module refusals**: a 403 at startup shows the reason from the module, for example a user outside the MCP User group. This works for API keys and for passwords. Faults 400, 403 and 429 from the module's XML-RPC proxy reach the model with their text, not as connection errors.
+- **Odoo errors labeled as connection errors**: an error that Odoo answered with, such as a bad domain operator, a bad selection value or an unknown method, read as "Connection error: Operation failed: ...". It now reads "Odoo error: ...", without the "Internal Server Error in" wrapper of older MCP modules. A rejected login is still a connection error.
+- **Unknown model in standard mode**: a model that is not installed read as "Could not verify access (connection error): Endpoint not found: /mcp/models/<model>/access". The tools now show the module's own message, "Model '<model>' not found in Odoo instance."
+- **`get_fields` with unknown names**: Odoo leaves out an unknown field or attribute name without a word. The note now names them.
+- **YOLO `list_models`**: it listed abstract models that hold no records, such as `base`, `_unknown` and, on Odoo 19 and later, every mixin. They are left out. The description says that the operations are in `yolo_mode.operations`, and the warning has no emoji.
+- **Search resource rows**: `odoo://{model}/search` numbered its rows by position only, and the numbers read like record IDs. Each row now shows its ID.
+- **`aggregate_records` ordered by an aggregate on Odoo 16**: `order="list_price:sum desc"` failed with "Invalid field", although the description gives that form. It is sent in the form Odoo 16 takes. Odoo 16 cannot order by `__count`, and the tool now says so.
+- **`post_message` errors and plain text on Odoo 16**: a missing record or attachment came back as Odoo's raw text with the user ID. The tool now says "Record not found" or "Attachment not found" before it posts. On Odoo 16 a plain-text body was stored as HTML; it is escaped as Odoo 17 and later do.
+- **Negative `limit`**: `search_records` and `aggregate_records` replaced a negative limit with the default without a word. It is now refused; 0 still means the default.
+- **Unknown field in an update**: on Odoo 19 and later, `update_record` and `update_records` with an unknown field failed with a bare `KeyError`. The field names are checked first; the message says that the field does not exist or that the user cannot see it.
+- **Descriptions of the Odoo-dependent features**: the instructions give the Odoo 19 limit of per-record `update_records`, the tool says that standard mode needs the MCP module to allow it, and its refusal suggests the other forms. `read_attachment` says that PDF text needs Odoo's `attachment_indexation` module.
+- **Reads of only `id` or binary fields for a missing record**: Odoo answers a read of only `id` without touching the table, so `get_record` returned `{"id": 999999}` for a record that does not exist. On Odoo 20 this also happened for a read of only binary fields. It now reports "Record not found".
+- **Clearer errors and record text**: a domain condition without three parts, an unknown field in an explicit read or a create, and a language that Odoo has not installed each get their own message, not Odoo's raw error. A model that is not installed no longer reads as "Access denied". The record resource shows a false boolean as "No", not "Not set".
+- **`update_record` on a missing id**: the existence check read only `id`. Odoo 19 and later echo that back for a missing record, so the call failed later with a generic write error. It now counts the record and reports "Record not found". Archived records still count as existing.
+
+## [0.8.0] - 2026-08-26
+
+### Added
+- **`get_current_context` tool**: returns the connected user, timezone, company scope and UTC guidance as structured data.
+- **Personalized `initialize` instructions**: the same context block is sent at handshake. When the user read fails it falls back to the UTC guidance plus a note naming the server's own reason (e.g. the caller is not in the MCP User group), or the likely cause when the server gives none.
+- **`get_fields` tool**: schema discovery with curated attributes by default; honors `field_names` and `attributes`.
+- **Binary & attachment resources**: `odoo://{model}/record/{id}/{field}` and `odoo://attachment/{id}`, served with per-read mimeTypes.
+- **No inlined base64**: populated binary fields are returned as fetchable resource URIs instead (reads use `bin_size`).
+- **x2many previews**: `get_record` returns display-name summaries for small collections in `related_summaries`.
+- **Inverse-field drilldown hints**: the record resource's one2many "view all" filters on the inverse field (generic `res_id` inverses and domain-restricted one2manys keep the id-in domain).
+- **Offset depth cap**: offsets are capped at 1000 pages of `limit`, floored at 10,000 rows.
+- **`aggregate_records` pagination**: reports `has_more` and `next_hint`.
+- **`aggregate_records` overall totals**: an omitted or empty `groupby` returns a single overall row.
+- **`post_message` subject**: optional `subject` argument.
+- **Archived records**: the record resource serves them (`active_test=False`), matching what `get_record` already returned.
+- **`all_fields_fallback`**: new `field_selection_method` value, reported when smart selection is unavailable and every field was read.
+
+### Security
+- **Attachment reads gate on the attached-to model**: `res_model` is checked alongside `ir.attachment`, so enabling that one model no longer exposes every attachment body on the database.
+- **Attachment metadata is gated too**: the `search_records`/`get_record`/`aggregate_records` tools and the record/search/count resources scope `ir.attachment` to `res_model`s the caller may read — a row carries `url` and `index_content` (the extracted document text). An allowlist the module cannot report fails closed, as a retryable "could not verify access".
+- **Attachment writes are gated too**: `create_record`/`update_record`/`delete_record` and `post_message`'s `attachment_ids` check the attached-to model. An ungated `update_record` could repoint an excluded model's attachment at an allowed one and then read it back, bypassing the read gate entirely.
+- **`run_http()` host/port removed**: it reassigned `app.settings.host` after FastMCP had already chosen transport security from `config.host`, so an embedder could bind loopback with DNS-rebinding protection left off; the bind now always follows `config.host`/`config.port`.
+- **Internal endpoints in error text**: hostnames, private IPs, ports and URLs are scrubbed from sanitized messages — a connection or DNS failure quotes the endpoint it tried, and the `ERROR_MAPPINGS` branch returned before the removal patterns ran.
+- **`ODOO_MCP_ALLOWED_HOSTS` Origin ports**: an entry that pins a port now pins it for `Origin` too; the wildcard `:*` origin trusted a page served from any other port on the same host.
+- **`ODOO_MCP_MAX_BINARY_SIZE`** (default 50 MB): bounds a single binary/attachment read, checked before the payload is fetched.
+- **Sensitive-field filtering**: credential-named fields are withheld from bulk reads with an explanatory note; explicitly named fields are still returned. Covers `*password`/`*_pass`/`*secret`/`*_token`, the `*_api_key`/`*_hmac_key`/`*_signature_key` compounds, OAuth refresh tokens, passkeys, salts, OTP secrets and PINs, including trailing-underscore spellings (`pass_`, `api_key_`).
+- **Credential-shaped log keys**: write-payload logging now uses the same detector as the read paths, so `smtp_pass`/`webhook_secret` are redacted instead of logged in cleartext.
+- **`call_model_method` alias gaps**: `copy_data`, `copy_multi`, `update`, `get_view` and `get_views` are refused alongside the primitives they alias.
+- **Sanitized error mappings**: captured fault text is scrubbed before interpolation — file paths, host:port pairs and memory addresses no longer reach the client through `ERROR_MAPPINGS`.
+- **`call_model_method` hardening**: rejects `ir.actions.*`/`ir.cron`, the `web_*` family, and ORM CRUD primitives; list results truncate at 100 items.
+
+### Fixed
+- **Smart field selection**: the non-stored score cap gated on a `compute` key `fields_get()` never returns; it now gates on `store=False` (related fields exempt).
+- **Oversized record ids**: ids outside the XML-RPC 32-bit range are rejected with a clean validation error before any RPC.
+- **Oversized ints in domains, values and method arguments**: domains, `create_record`/`update_record` values and `call_model_method` arguments are all range-checked, instead of an `OverflowError` surfacing as `Connection error: Operation failed`.
+- **YOLO `list_models` cap**: the silent 200-model cap is gone — listings truncate at 500 with an explicit note and the real total.
+- **YOLO `list_models` filter**: the system-model exclusion is prefix-anchored (`!` + `=like`); plain `like` matched substrings and hid every model merely containing `ir.`/`base.` (`repair.*`, ...).
+- **Fault classification**: business faults route on Odoo's `faultCode` (2 = UserError/ValidationError, 4 = AccessError), the only signal `/xmlrpc/2/*` sends — previously every business error read as `Connection error: Operation failed:`.
+- **Business error line structure**: multi-line messages keep their newlines, and trailing `CONTEXT:`/`HINT:` lines are no longer stripped from business exceptions (psycopg2 diagnostics still are).
+- **Traceback frame detection**: a frame is matched by shape, so a business message quoting a filename at line start is no longer mistaken for one and truncated.
+- **Unsanitized error paths**: the record, search, count and fields resource handlers scrub the exception before surfacing it.
+- **Non-loopback bind warning**: the HTTP startup warning now also states that DNS-rebinding protection is off unless `ODOO_MCP_ALLOWED_HOSTS` is set.
+- **`ODOO_MCP_ALLOWED_HOSTS` port-less authority**: a port-less entry now also allows the bare `Host`/`Origin` a proxy sends on 80/443, which previously matched nothing.
+- **`ODOO_MCP_ALLOWED_HOSTS` IPv6**: bracketed and bare literals are parsed and normalized instead of producing junk patterns that locked the deployment out.
+- **HTTP session teardown**: keys off the transport that actually started, so `run_http()` under a default stdio config no longer strands tool handlers on a dead connection (#70).
+- **`aggregate_records` groupby collision**: aggregating a field that is also a groupby key is refused on the pre-19 path instead of returning corrupted groups.
+- **`aggregate_records` duplicate aggregates**: two aggregates over one field are refused on the pre-19 path, where `read_group` dropped one and mislabeled the other.
+- **`__extra_domain` drilldown contract**: documented — AND it with the caller's `domain` (group condition only on Odoo 19; already the full domain on older servers).
+- **`list_resource_templates`**: unreadable models are filtered out when `/mcp/models` reports per-model `operations` (best-effort — older modules omit the block and everything stays listed).
+- **`id:` aggregates on Odoo 15/16**: refused with an explanation — `read_group` deletes the `id` key before returning, so the value silently never arrived.
+- **`__extra_domain` on overall totals**: the key is always present for `groupby=[]`, filled in as `[]` on Odoo 15/16, which omit it entirely (17/18 return the caller's domain, 19 a trivially-true condition — re-ANDing any of them is a no-op).
+- **Unbalanced domains**: a domain whose `&`/`|`/`!` operators lack operands is rejected with a clear message before any RPC, instead of reaching Odoo as a server-side "syntactically not correct".
+- **Deeply nested `domain`/`fields` strings**: rejected on their own nesting depth rather than on the parser failing, so a 2 KB `[[[[...]]]]` is an invalid parameter on every interpreter — CPython 3.12 raised the JSON scanner's recursion ceiling, making the same input a stack-exhausting success there and a `RecursionError` on 3.11. Depth is counted quote-aware, so bracket characters inside values do not trip it.
+- **Mutated caller context dicts**: `search()`, `read()` and `search_read()` copy the `context` they are given — `execute_kw` injects the locale into it, so a caller reusing one dict accumulated our keys.
+- **Caller-supplied invalid `lang`**: no longer blamed on `ODOO_MCP_LOCALE` — a bad context language used to null the configured locale for every later request in the process.
+- **`ModelInfo.operations` description**: was "Allowed operations (standard mode only)"; now states it is null in YOLO mode, where the flags are global and reported once under `yolo_mode.operations`.
+- **Session cookie race**: the REST session id is read under the lock that creates it, so a concurrent 401 handler can no longer produce `Cookie: session_id=None`.
+- **Self-explaining access refusals were flattened**: the sanitizer rewrote any message merely *containing* "access denied" to a bare `Permission denied for this operation`, so the module's actionable wording (e.g. a user outside the MCP User group) never reached the caller; only a bare refusal maps to the generic text now.
+- **Doubled "Access denied: " prefix**: refusals that already label themselves are no longer prefixed again across the tool and resource handlers.
+- **`list_models` swallowed the reason**: an access failure reported `Failed to list models: Permission denied for this operation` instead of what the server actually said.
+- **Discarded 403 diagnostics**: the MCP module's own message (`Model 'x' is not enabled for MCP access.`) is surfaced instead of a generic `Access denied to MCP endpoints`, which pointed at a credential problem that did not exist.
+
+### Changed
+- **Documentation pass**: corrected stale claims (mcp ≥1.27 floor, YOLO auth needing `ODOO_USER`, Odoo 17+ HTML escaping, `handle_error` contract), documented `ODOO_MCP_LOG_FORMAT`/`ODOO_MCP_SLOW_OPERATION_THRESHOLD_MS`, and consolidated duplicated comments.
+- **`list_models` counts**: `total` is the number of models returned and `total_available` the database count; both are emitted in every mode.
+- **Stored binaries in resource reads**: the record/search resources previously skipped every binary field; stored ones are now read under `bin_size` and rendered as fetchable URIs. Non-stored ones stay out — `bin_size` cannot short-circuit a compute (`sale.order.tax_totals` made a 10-row read 3.3x slower).
+- **Default search resource reads**: `odoo://{model}/search` reads only the fields its one-line summary renders, instead of every safe field of every record and then discarding them.
+- **CI targets Odoo 19**: both integration jobs run on `odoo:19`, and the MCP job now sources the module from `much-GmbH/much-mcp-server@19.0` (was `ivnvxd/odoo-apps@18.0`) using the `MCP_MODULE_PAT` secret. The module's declared Python dependencies are installed into the Odoo image so `mcp_server` can install.
+- **`mcp` floor raised to 1.27**: `session_idle_timeout` is passed to `StreamableHTTPSessionManager`, which does not accept it before 1.27.
+
+### Removed
+- **`build_search_uri`**: unused public helper removed from `uri_schema`.
+- **`Cache.invalidate_pattern`**: orphaned when the record cache was removed.
+
+## [0.7.1] - 2026-06-12
+
+### Added
+- **`ODOO_MCP_ALLOWED_HOSTS`**: comma-separated `Host` headers to accept for the `streamable-http` transport (DNS-rebinding protection). Needed when running behind a reverse proxy that forwards an external host; unset preserves the prior behavior (the SDK auto-enables protection for a loopback bind only) (#45, @Miriup).
+- **`ODOO_MCP_SESSION_IDLE_TIMEOUT`**: seconds of inactivity before a `streamable-http` session is closed and its server-side state freed; unset preserves the prior behavior (sessions never expire).
+
+### Changed
+- **Dependencies**: refreshed the lockfile — `mcp` 1.26.0 → 1.27.2 (streamable-http idle timeout, mid-request transport-close handling, pydantic 2.13 compat), `pydantic` 2.11 → 2.13, `starlette` 0.47 → 1.3, plus dev tooling (ruff, ty, pytest 9). Full suite green against the new stack.
+
+## [0.7.0] - 2026-06-11
+
+### Fixed
+- **`delete_record` on records without a display name** (e.g. `mail.message`): the unlink succeeded but the result then failed schema validation (`deleted_name` received Odoo's `False`), so clients believed the delete had failed — now falls back to an ID label.
+- **Timeouts**: Socket timeouts now actually apply to XML-RPC connections — a hung Odoo server fails fast instead of blocking forever.
+- **Half-open keepalive recovery** (#68): a timeout on a reused keepalive socket (LB dropped the upstream without FIN/RST) transparently retries once on a fresh connection — idempotent calls only: read-only model methods plus login/version/db-list probes (a timed-out write is never re-sent, it could be double-executed by a slow server); timeouts on fresh connections are NOT retried.
+- **streamable-http sessions** (#70): the Odoo connection and registered handlers now persist across HTTP sessions — previously every tool call after the first failed with "Not authenticated with Odoo" because session teardown disconnected Odoo. stdio still cleans up on exit.
+- **Event loop**: Blocking XML-RPC/HTTP calls offloaded to worker threads; concurrent tool calls and pings stay responsive during slow operations.
+- **YOLO `list_models`**: System-model exclusion was a no-op (tautological domain) — results were dominated by `ir.*`/`base.*` models.
+- **Domain parsing**: String domains no longer corrupt values containing `True`/`False` substrings (e.g. `'True North'`).
+- **Binary fields**: `search_records`/`get_record` results with binary/datetime fields serialize cleanly instead of erroring.
+- **`fields=[]`**: Treated as smart defaults instead of silently fetching ALL fields.
+- **`list_resource_templates`**: YOLO mode reports "all models available" instead of `total_models: 0`.
+- **Search resource**: `odoo://{model}/search` skips binary/html fields like the record path; pagination hints now reference the `search_records` tool instead of emitting unroutable query-param URIs.
+- **Formatters**: Float precision honors `digits` metadata; unset names render `Record {id}` instead of `False`; long values truncated with a marker; x2many "View all" hints carry real record ids.
+- **Cache**: Memory budget actually enforced (looped eviction); replacing a key no longer evicts an unrelated entry.
+- **Error sanitizer**: Server tracebacks reduced to the final error message (multi-line business errors kept intact) — no more leaked source lines, SQL constraint names, or row values; no more literal `{}` placeholders in error messages.
+- **Error classification**: Builtin `PermissionError`/`ConnectionError` no longer misclassified as critical system errors (custom classes shadowed the builtins); access-control infrastructure failures report as connection errors, not "Access denied".
+- **Config precedence**: `ODOO_MCP_TRANSPORT`/`HOST`/`PORT`/`LOG_LEVEL` set only in `.env` now take effect; invalid `ODOO_MCP_PORT` or `ODOO_MCP_SLOW_OPERATION_THRESHOLD_MS` no longer crash startup/import with raw tracebacks.
+- **Auth fallback**: After a rejected API key falls back to password auth, permission checks use session auth instead of resending the dead key (which 401'd every tool call).
+- **Logging**: Sensitive keys (passwords, API keys, tokens) redacted in debug-log write payloads; database names moved to DEBUG level.
+- **Version**: `SERVER_VERSION` derives from the package version; a test pins it to pyproject.toml (v0.5.2 shipped reporting 0.5.1).
+
+### Changed
+- **TLS**: HTTPS transports share one `ssl.SSLContext` to amortize handshake cost across the per-proxy sockets introduced in 0.6.0.
+- **HTTP transport**: Loud startup warning when binding a non-loopback host (the transport has no built-in authentication); README security notes added.
+- **Dead code removed** (~550 lines): never-wired record/permission caches, `RequestOptimizer`, the browse resource chain, and the unused error metrics/conversion API; `ConnectionPool` simplified to the proxy factory it actually was.
+- **CI**: Push trigger limited to `main`/`dev` (PRs cover feature branches; kills duplicate runs); Dependabot switched to the `uv` ecosystem so `uv.lock` gets update/security PRs; publish workflow verifies the built version against the release tag (manual dispatch requires typed version confirmation); Python 3.13 classifier added; MCP integration job skips Dependabot PRs — repository secrets aren't available to them, so the private-module checkout failed with "Input required and not supplied: token"; Dependabot version-update PRs now target `dev` directly (manual retargeting desynced Dependabot's base-branch metadata); codecov-action bumped to v7 (supersedes the stuck Dependabot PR).
+- **`--help`**: documents `ODOO_MCP_ENABLE_METHOD_CALLS`.
+- **Tests**: integration suite hardened — MCP-module detection works on multi-database instances (health probe sends `X-Odoo-Database`); an env-var leak that wedged spawned transport servers under DEBUG logging fixed; vacuous `if records:` guards replaced with real fixtures and assertions; MCP test client `read_resource` returned `""` (matched the wrong content type).
+
+## [0.6.0] - 2026-05-02
+
+### Added
+- **`aggregate_records` tool**: Server-side aggregation via Odoo's grouping methods (#64). Dispatches to `formatted_read_group` on Odoo 19+ and falls back to `read_group` with response normalization on older versions.
+- **`call_model_method` tool** (YOLO-only, opt-in via `ODOO_MCP_ENABLE_METHOD_CALLS`): generic XML-RPC `execute_kw` escape hatch for workflow actions not covered by CRUD.
+
+### Fixed
+- **Concurrent tool calls**: Per-proxy XML-RPC transport prevents wire-state corruption when multiple tools run in parallel (#44).
+- **CI**: Disable MCP rate limiting in integration tests — the 300/min ceiling tripped mid-suite under the shared admin API key. Production keeps the default.
+
+## [0.5.2] - 2026-04-30
+
+### Added
+- **`post_message` tool**: Post to an Odoo record's chatter via `mail.thread.message_post()` (#50).
+
+### Fixed
+- **Stdio transport**: Drop terminal `notifications/progress` from `search_records` and `list_models` — strict MCP clients treated the post-response notification as a fatal protocol error and tore down the transport.
+
+## [0.5.1] - 2026-04-23
+
+### Fixed
+- **CI**: Skip MCP integration tests for fork PRs where repository secrets are unavailable
+- **Search**: Cap over-limit to `max_limit` instead of resetting to `default_limit` (#57, @litnimax)
+- **Search**: `ODOO_MCP_DEFAULT_LIMIT` now applies when clients omit `limit` — previously hardcoded, bypassing the env var in the common case (#61)
+
+## [0.5.0] - 2026-02-28
+
+### Added
+- **Lifespan hooks**: Consolidated duplicated setup/teardown from `run_stdio()` and `run_http()` into a single `_odoo_lifespan()` async context manager passed to FastMCP — transport methods are now thin wrappers
+- **Context injection**: All 7 tool functions and 4 resource functions accept `ctx: Context` for client-visible observability — sends info/warning/progress notifications to MCP clients in real time
+- **Health endpoint**: `GET /health` HTTP route via FastMCP `custom_route` — returns connection status and version as JSON for load balancers and monitoring
+- **Model autocomplete**: FastMCP completion handler returns matching model names when clients request autocomplete for `model` parameters in resource URIs
+
+### Changed
+- **Health endpoint**: Simplified response to `status`, `version`, and `connected` only — removed `url`, `database`, `error_metrics`, `recent_errors`, and `performance` fields
+- **Tests**: Overhaul test suite — replace fake MCP protocol simulators with real handler calls, mock only at the XML-RPC network boundary, add CRUD/tool/lifespan/completion coverage, remove example-only and mock-asserting tests
+
+### Fixed
+- **Boolean formatting**: `False` values displayed as "Not set" instead of "No" in formatted output due to branch precedence bug in `_format_simple_value()`
+- **Completion handler**: Returned raw list instead of `Completion(values=...)`, breaking MCP protocol contract
+- **Lifespan cleanup**: Connection cleanup didn't run when setup failed because setup was outside the `try` block
+
+## [0.4.5] - 2026-02-27
+
+### Changed
+- **Documentation**: Synchronized `--help`, `.env.example`, and README with all current environment variables and test commands
+- **CI**: Run lint and unit tests in parallel; gate integration tests to PRs and main/dev branches; add concurrency groups and uv caching
+- **Project config**: Clean up `.gitignore`, trim redundant dependencies, consolidate dev tooling config
+
+## [0.4.4] - 2026-02-25
+
+### Changed
+- **Connection startup**: `OdooConnection.connect()` resolves the target database *before* creating MCP proxies in standard mode, setting the `X-Odoo-Database` header for `_test_connection()` and all subsequent calls
+- **`AccessController` auth**: Supports session-cookie authentication as fallback when no API key is configured — authenticates via `/web/session/authenticate` and retries once on session expiry
+
+### Fixed
+- **All standard-mode auth combinations now work**: API-key-only (S1/S2), API-key + user/pass (S3/S4), and user/pass-only (S5/S6) — with or without explicit `ODOO_DB` — all connect, authenticate, and pass access control. Previously S1–S6 could fail with 404 on multi-DB servers
+- **Multi-database routing**: Standard mode MCP endpoints (`/mcp/xmlrpc/*`, `/mcp/models`, `/mcp/health`, etc.) returned 404 when multiple databases existed in PostgreSQL because Odoo couldn't determine which DB to route to. Now sends `X-Odoo-Database` header on all MCP requests (XML-RPC and REST)
+- **DB endpoint routing**: Database listing now always uses the server-wide `/xmlrpc/db` endpoint instead of `/mcp/xmlrpc/db`, since the latter requires a DB context that isn't available yet
+
+## [0.4.3] - 2026-02-24
+
+### Changed
+- **CI**: Reduce Python matrix to 3.10 + 3.13; add YOLO and MCP integration test jobs with Odoo 18 + PostgreSQL 17 Docker containers
+- **Test markers**: Rename `integration` → `mcp`, `e2e` → `yolo`, drop `odoo_required`; add markers to 30 previously-invisible tests; remove `RUN_MCP_TESTS` gate
+- **CI coverage**: Collect coverage from unit, YOLO and MCP jobs; merge and upload to Codecov
+
+### Fixed
+- **Standard mode auth**: `AccessController` no longer crashes at startup when only username/password is configured (without `ODOO_API_KEY`). Now logs a warning and defers auth failure to REST call time with actionable error messages suggesting `ODOO_API_KEY` or YOLO mode
+
+## [0.4.2] - 2026-02-23
+
+### Added
+- **Docker support**: Multi-stage Dockerfile with `uv` for fast builds, and GitHub Actions workflow for multi-platform images (amd64 + arm64) published to both GHCR and Docker Hub
+
+## [0.4.1] - 2026-02-22
+
+### Added
+- **Multi-language support**: New `ODOO_LOCALE` environment variable to get Odoo responses in any installed language (e.g. `es_ES`, `fr_FR`, `de_DE`). Validates locale at startup and falls back to default language if not installed. (#23)
+
+### Fixed
+- **Models without `name` field**: `create_record` and `update_record` failed on models like `mail.activity` that lack a `name` field due to hardcoded field list in post-operation read-back
+- **Version-aware record URLs**: `create_record` and `update_record` now generate `/odoo/{model}/{id}` URLs for Odoo 18+ instead of the legacy `/web#id=...` format (which is still used for Odoo ≤ 17)
+
+## [0.4.0] - 2026-02-22
+
+### Added
+- **Structured output**: All tools return typed Pydantic models with auto-generated JSON schemas for MCP clients (`SearchResult`, `RecordResult`, `ModelsResult`, `CreateResult`, `UpdateResult`, `DeleteResult`)
+- **Tool annotations**: All tools declare `readOnlyHint`, `destructiveHint`, `idempotentHint`, and `openWorldHint` via MCP `ToolAnnotations`
+- **Resource annotations**: All resources declare `audience` and `priority` via MCP `Annotations`
+- **Human-readable titles**: All tools and resources include `title` for better display in MCP clients
+
+### Changed
+- **MCP SDK**: Upgraded from `>=1.9.4` to `>=1.26.0,<2`
+- **`get_record` structured output**: Returns `RecordResult` with separate `record` and `metadata` fields instead of injecting `_metadata` into record data
+- **Tooling**: Replace black/mypy with ruff format/ty for formatting and type checking
+
+### Fixed
+- **VertexAI compatibility**: Simplified `search_records` `domain`/`fields` type hints from `Union` to `Optional[Any]` to avoid `anyOf` JSON schemas rejected by VertexAI/Google ADK (#27)
+- **Stale record data**: Removed record-level caching from `read()` to prevent returning stale field values (e.g. `active`) when records change in Odoo between calls (#28)
+- **Tests**: Integration tests now use `ODOO_URL` for server detection, deduplicated server checks, fixed async test handling, updated assertions for structured output types, halved suite runtime
+
+### Removed
+- Legacy error type aliases (`ToolError`, `ResourceError`, `ResourceNotFoundError`, `ResourcePermissionError`) — use `ValidationError`, `NotFoundError`, `PermissionError` directly
+- Unused `_setup_handlers()` method from `OdooMCPServer`
+
+## [0.3.1] - 2026-02-21
+
+### Fixed
+- **Authentication bypass**: Add missing `@property` on `is_authenticated` — was always truthy as a method reference, bypassing auth guards
+
+### Changed
+- Update CI dependencies (black 26.1.0, GitHub Actions v6/v7)
+- Server version test validates semver format instead of hardcoded value
+
 ## [0.3.0] - 2025-09-14
 
 ### Added

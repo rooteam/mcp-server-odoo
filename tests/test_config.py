@@ -30,7 +30,7 @@ class TestOdooConfig:
         assert config.uses_api_key is True
         assert config.uses_credentials is False
         assert config.log_level == "INFO"
-        assert config.default_limit == 10
+        assert config.default_limit == 25
         assert config.max_limit == 100
 
     def test_valid_config_with_credentials(self):
@@ -118,6 +118,40 @@ class TestLoadConfig:
         assert config.default_limit == 20
         assert config.max_limit == 200
 
+    def test_load_config_allowed_companies(self, monkeypatch):
+        """Test parsing of ODOO_ALLOWED_COMPANIES into a list of ints."""
+        monkeypatch.setenv("ODOO_URL", "http://test.odoo.com")
+        monkeypatch.setenv("ODOO_API_KEY", "env-api-key")
+        monkeypatch.setenv("ODOO_ALLOWED_COMPANIES", "1, 4")
+
+        config = load_config()
+
+        assert config.allowed_companies == [1, 4]
+
+    def test_load_config_allowed_companies_unset(self, monkeypatch):
+        """ODOO_ALLOWED_COMPANIES absent or empty means no company scoping."""
+        monkeypatch.setenv("ODOO_URL", "http://test.odoo.com")
+        monkeypatch.setenv("ODOO_API_KEY", "env-api-key")
+        monkeypatch.delenv("ODOO_ALLOWED_COMPANIES", raising=False)
+
+        assert load_config().allowed_companies is None
+
+        monkeypatch.setenv("ODOO_ALLOWED_COMPANIES", "")
+        assert load_config().allowed_companies is None
+
+        # Only separators/whitespace parses to nothing usable -> unset
+        monkeypatch.setenv("ODOO_ALLOWED_COMPANIES", " , ")
+        assert load_config().allowed_companies is None
+
+    def test_load_config_allowed_companies_invalid(self, monkeypatch):
+        """Non-integer entries in ODOO_ALLOWED_COMPANIES are rejected."""
+        monkeypatch.setenv("ODOO_URL", "http://test.odoo.com")
+        monkeypatch.setenv("ODOO_API_KEY", "env-api-key")
+        monkeypatch.setenv("ODOO_ALLOWED_COMPANIES", "1,main")
+
+        with pytest.raises(ValueError, match="comma-separated list of integer IDs"):
+            load_config()
+
     def test_load_config_from_env_file(self, monkeypatch):
         """Test loading configuration from .env file."""
         # Clear environment variables
@@ -169,6 +203,26 @@ class TestLoadConfig:
             assert config.api_key == "env-key"
         finally:
             os.unlink(env_file)
+
+    def test_locale_loaded_from_env(self, monkeypatch):
+        """Test that locale is loaded from ODOO_LOCALE env var."""
+        monkeypatch.setenv("ODOO_URL", "http://localhost:8069")
+        monkeypatch.setenv("ODOO_API_KEY", "test-key")
+        monkeypatch.setenv("ODOO_LOCALE", "fr_FR")
+
+        config = load_config()
+
+        assert config.locale == "fr_FR"
+
+    def test_max_smart_fields_loaded_from_env(self, monkeypatch):
+        """Test that max_smart_fields is loaded from ODOO_MCP_MAX_SMART_FIELDS env var."""
+        monkeypatch.setenv("ODOO_URL", "http://localhost:8069")
+        monkeypatch.setenv("ODOO_API_KEY", "test-key")
+        monkeypatch.setenv("ODOO_MCP_MAX_SMART_FIELDS", "25")
+
+        config = load_config()
+
+        assert config.max_smart_fields == 25
 
     def test_load_config_with_empty_strings(self, monkeypatch):
         """Test that empty strings are treated as None."""
@@ -286,7 +340,7 @@ class TestYoloMode:
         paths = config.get_endpoint_paths()
         assert paths["common"] == "/mcp/xmlrpc/common"
         assert paths["object"] == "/mcp/xmlrpc/object"
-        assert paths["db"] == "/mcp/xmlrpc/db"
+        assert paths["db"] == "/xmlrpc/db"
 
     def test_endpoint_paths_yolo_modes(self):
         """Test endpoint paths in YOLO modes."""
@@ -322,13 +376,52 @@ class TestYoloMode:
         )
         assert config.is_yolo_enabled is True
 
-        # YOLO mode without proper auth - should fail
+        # XML-RPC needs a username with the API key
         with pytest.raises(ValueError, match="YOLO mode requires"):
             OdooConfig(
                 url="http://localhost:8069",
                 api_key="test-key",  # Missing username
                 yolo_mode="read",
+                rpc_transport="xmlrpc",
             )
+
+        # JSON-2 reads the user from the key, so "auto" and "json2" take it alone
+        for transport in ("auto", "json2"):
+            config = OdooConfig(
+                url="http://localhost:8069",
+                api_key="test-key",
+                yolo_mode="read",
+                rpc_transport=transport,
+            )
+            assert config.username is None
+
+    def test_rpc_transport(self, monkeypatch):
+        monkeypatch.setenv("ODOO_URL", "http://localhost:8069")
+        monkeypatch.setenv("ODOO_API_KEY", "test-key")
+        monkeypatch.setenv("ODOO_YOLO", "read")
+        monkeypatch.delenv("ODOO_RPC_TRANSPORT", raising=False)
+        assert load_config().rpc_transport == "auto"
+
+        monkeypatch.setenv("ODOO_RPC_TRANSPORT", " JSON2 ")
+        assert load_config().rpc_transport == "json2"
+
+        monkeypatch.setenv("ODOO_RPC_TRANSPORT", "grpc")
+        with pytest.raises(ValueError, match="Invalid ODOO_RPC_TRANSPORT: grpc"):
+            load_config()
+
+    def test_json2_needs_an_api_key(self):
+        with pytest.raises(ValueError, match="json2 needs ODOO_API_KEY"):
+            OdooConfig(
+                url="http://localhost:8069",
+                username="admin",
+                password="admin",
+                yolo_mode="read",
+                rpc_transport="json2",
+            )
+
+    def test_json2_is_refused_in_standard_mode(self):
+        with pytest.raises(ValueError, match="json2 needs ODOO_YOLO=read or true"):
+            OdooConfig(url="http://localhost:8069", api_key="k", rpc_transport="json2")
 
     def test_yolo_mode_from_env(self, monkeypatch):
         """Test loading YOLO mode from environment variables."""
@@ -380,3 +473,215 @@ class TestYoloMode:
             monkeypatch.setenv("ODOO_YOLO", value)
             config = load_config()
             assert config.yolo_mode == "true"
+
+
+class TestEnableMethodCalls:
+    """Tests for the ODOO_MCP_ENABLE_METHOD_CALLS opt-in flag."""
+
+    def test_default_is_false(self, monkeypatch):
+        monkeypatch.setenv("ODOO_URL", "http://localhost:8069")
+        monkeypatch.setenv("ODOO_API_KEY", "test-key")
+        # monkeypatch.setenv beats load_dotenv (which won't override existing
+        # env vars), so we get a deterministic falsy value even if a local
+        # .env file has the flag set.
+        monkeypatch.setenv("ODOO_MCP_ENABLE_METHOD_CALLS", "")
+        config = load_config()
+        assert config.enable_method_calls is False
+
+    def test_truthy_values_enable(self, monkeypatch):
+        monkeypatch.setenv("ODOO_URL", "http://localhost:8069")
+        monkeypatch.setenv("ODOO_API_KEY", "test-key")
+        monkeypatch.setenv("ODOO_USER", "admin")
+        monkeypatch.setenv("ODOO_YOLO", "true")
+        for value in ["true", "1", "yes", "TRUE", "True"]:
+            monkeypatch.setenv("ODOO_MCP_ENABLE_METHOD_CALLS", value)
+            config = load_config()
+            assert config.enable_method_calls is True, f"failed for {value!r}"
+
+    def test_falsy_values_disable(self, monkeypatch):
+        monkeypatch.setenv("ODOO_URL", "http://localhost:8069")
+        monkeypatch.setenv("ODOO_API_KEY", "test-key")
+        for value in ["false", "0", "no", "off", ""]:
+            monkeypatch.setenv("ODOO_MCP_ENABLE_METHOD_CALLS", value)
+            config = load_config()
+            assert config.enable_method_calls is False, f"failed for {value!r}"
+
+    def test_warning_when_enabled_without_full_yolo(self, monkeypatch, caplog):
+        """Misconfiguration: opt-in without full YOLO emits a WARNING."""
+        monkeypatch.setenv("ODOO_URL", "http://localhost:8069")
+        monkeypatch.setenv("ODOO_API_KEY", "test-key")
+        monkeypatch.setenv("ODOO_USER", "admin")
+        monkeypatch.setenv("ODOO_MCP_ENABLE_METHOD_CALLS", "true")
+
+        for yolo in ["off", "read"]:
+            monkeypatch.setenv("ODOO_YOLO", yolo)
+            caplog.clear()
+            with caplog.at_level("WARNING", logger="mcp_server_odoo.config"):
+                load_config()
+            assert any(
+                "ODOO_MCP_ENABLE_METHOD_CALLS=true ignored" in r.message for r in caplog.records
+            ), f"missing warning for yolo={yolo!r}"
+
+    def test_no_warning_when_enabled_with_full_yolo(self, monkeypatch, caplog):
+        monkeypatch.setenv("ODOO_URL", "http://localhost:8069")
+        monkeypatch.setenv("ODOO_API_KEY", "test-key")
+        monkeypatch.setenv("ODOO_USER", "admin")
+        monkeypatch.setenv("ODOO_YOLO", "true")
+        monkeypatch.setenv("ODOO_MCP_ENABLE_METHOD_CALLS", "true")
+
+        with caplog.at_level("WARNING", logger="mcp_server_odoo.config"):
+            load_config()
+        assert not any(
+            "ODOO_MCP_ENABLE_METHOD_CALLS=true ignored" in r.message for r in caplog.records
+        )
+
+
+class TestAllowedHosts:
+    """Test allowed hosts configuration for DNS rebinding protection."""
+
+    def test_allowed_hosts_default_empty(self):
+        """Test allowed_hosts defaults to empty list."""
+        config = OdooConfig(url="http://localhost:8069", api_key="test")
+        assert config.allowed_hosts == []
+
+    def test_allowed_hosts_set_directly(self):
+        """Test allowed_hosts can be set directly."""
+        config = OdooConfig(
+            url="http://localhost:8069",
+            api_key="test",
+            allowed_hosts=["localhost", "example.com"],
+        )
+        assert config.allowed_hosts == ["localhost", "example.com"]
+
+    def test_allowed_hosts_from_env_single(self, monkeypatch):
+        """Test loading single allowed host from environment."""
+        monkeypatch.setenv("ODOO_URL", "http://localhost:8069")
+        monkeypatch.setenv("ODOO_API_KEY", "test-key")
+        monkeypatch.setenv("ODOO_MCP_ALLOWED_HOSTS", "localhost")
+
+        config = load_config()
+
+        assert config.allowed_hosts == ["localhost"]
+
+    def test_allowed_hosts_from_env_multiple(self, monkeypatch):
+        """Test loading multiple allowed hosts from environment."""
+        monkeypatch.setenv("ODOO_URL", "http://localhost:8069")
+        monkeypatch.setenv("ODOO_API_KEY", "test-key")
+        monkeypatch.setenv("ODOO_MCP_ALLOWED_HOSTS", "localhost,example.com,odoo.local")
+
+        config = load_config()
+
+        assert config.allowed_hosts == ["localhost", "example.com", "odoo.local"]
+
+    def test_allowed_hosts_from_env_with_whitespace(self, monkeypatch):
+        """Test that whitespace is trimmed from allowed hosts."""
+        monkeypatch.setenv("ODOO_URL", "http://localhost:8069")
+        monkeypatch.setenv("ODOO_API_KEY", "test-key")
+        monkeypatch.setenv("ODOO_MCP_ALLOWED_HOSTS", " localhost , example.com , odoo.local ")
+
+        config = load_config()
+
+        assert config.allowed_hosts == ["localhost", "example.com", "odoo.local"]
+
+    def test_allowed_hosts_from_env_empty_string(self, monkeypatch):
+        """Test that empty string results in empty list."""
+        monkeypatch.setenv("ODOO_URL", "http://localhost:8069")
+        monkeypatch.setenv("ODOO_API_KEY", "test-key")
+        monkeypatch.setenv("ODOO_MCP_ALLOWED_HOSTS", "")
+
+        config = load_config()
+
+        assert config.allowed_hosts == []
+
+    def test_allowed_hosts_from_env_whitespace_only(self, monkeypatch):
+        """Test that whitespace-only string results in empty list."""
+        monkeypatch.setenv("ODOO_URL", "http://localhost:8069")
+        monkeypatch.setenv("ODOO_API_KEY", "test-key")
+        monkeypatch.setenv("ODOO_MCP_ALLOWED_HOSTS", "   ")
+
+        config = load_config()
+
+        assert config.allowed_hosts == []
+
+    def test_allowed_hosts_skips_empty_entries(self, monkeypatch):
+        """Test that empty entries between commas are skipped."""
+        monkeypatch.setenv("ODOO_URL", "http://localhost:8069")
+        monkeypatch.setenv("ODOO_API_KEY", "test-key")
+        monkeypatch.setenv("ODOO_MCP_ALLOWED_HOSTS", "localhost,,example.com,  ,odoo.local")
+
+        config = load_config()
+
+        assert config.allowed_hosts == ["localhost", "example.com", "odoo.local"]
+
+    def test_allowed_hosts_with_ports(self, monkeypatch):
+        """Test allowed hosts can include port numbers."""
+        monkeypatch.setenv("ODOO_URL", "http://localhost:8069")
+        monkeypatch.setenv("ODOO_API_KEY", "test-key")
+        monkeypatch.setenv("ODOO_MCP_ALLOWED_HOSTS", "localhost:8000,example.com:443")
+
+        config = load_config()
+
+        assert config.allowed_hosts == ["localhost:8000", "example.com:443"]
+
+
+class TestSessionIdleTimeout:
+    """Test session idle timeout configuration for HTTP transport."""
+
+    def test_default_is_none(self):
+        """Test session_idle_timeout defaults to None (never expire)."""
+        config = OdooConfig(url="http://localhost:8069", api_key="test")
+        assert config.session_idle_timeout is None
+
+    def test_set_directly(self):
+        """Test session_idle_timeout can be set directly."""
+        config = OdooConfig(url="http://localhost:8069", api_key="test", session_idle_timeout=600)
+        assert config.session_idle_timeout == 600
+
+    def test_from_env(self, monkeypatch):
+        """Test loading session idle timeout from environment."""
+        monkeypatch.setenv("ODOO_URL", "http://localhost:8069")
+        monkeypatch.setenv("ODOO_API_KEY", "test-key")
+        monkeypatch.setenv("ODOO_MCP_SESSION_IDLE_TIMEOUT", "600")
+
+        config = load_config()
+
+        assert config.session_idle_timeout == 600.0
+
+    def test_from_env_fractional(self, monkeypatch):
+        """Test fractional seconds are accepted."""
+        monkeypatch.setenv("ODOO_URL", "http://localhost:8069")
+        monkeypatch.setenv("ODOO_API_KEY", "test-key")
+        monkeypatch.setenv("ODOO_MCP_SESSION_IDLE_TIMEOUT", "2.5")
+
+        config = load_config()
+
+        assert config.session_idle_timeout == 2.5
+
+    def test_empty_env_means_none(self, monkeypatch):
+        """Test an empty value leaves the timeout disabled."""
+        monkeypatch.setenv("ODOO_URL", "http://localhost:8069")
+        monkeypatch.setenv("ODOO_API_KEY", "test-key")
+        monkeypatch.setenv("ODOO_MCP_SESSION_IDLE_TIMEOUT", "")
+
+        config = load_config()
+
+        assert config.session_idle_timeout is None
+
+    def test_invalid_value_raises(self, monkeypatch):
+        """Test a non-numeric value raises a clear error."""
+        monkeypatch.setenv("ODOO_URL", "http://localhost:8069")
+        monkeypatch.setenv("ODOO_API_KEY", "test-key")
+        monkeypatch.setenv("ODOO_MCP_SESSION_IDLE_TIMEOUT", "soon")
+
+        with pytest.raises(ValueError, match="ODOO_MCP_SESSION_IDLE_TIMEOUT"):
+            load_config()
+
+    def test_zero_raises(self):
+        """Test zero is rejected (SDK requires a positive timeout)."""
+        with pytest.raises(ValueError, match="must be positive"):
+            OdooConfig(url="http://localhost:8069", api_key="test", session_idle_timeout=0)
+
+    def test_negative_raises(self):
+        """Test negative values are rejected."""
+        with pytest.raises(ValueError, match="must be positive"):
+            OdooConfig(url="http://localhost:8069", api_key="test", session_idle_timeout=-5)

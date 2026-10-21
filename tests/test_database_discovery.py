@@ -4,9 +4,10 @@ This module tests database listing, auto-selection logic, and
 database validation features.
 """
 
+import json
 import os
-import socket
-from unittest.mock import Mock
+import urllib.error
+from unittest.mock import MagicMock, Mock, patch
 from xmlrpc.client import Fault
 
 import pytest
@@ -15,21 +16,27 @@ from mcp_server_odoo.config import OdooConfig
 from mcp_server_odoo.odoo_connection import OdooConnection, OdooConnectionError
 
 
-def is_odoo_server_running(host="localhost", port=8069):
-    """Check if Odoo server is running."""
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.settimeout(1)
-    try:
-        result = sock.connect_ex((host, port))
-        return result == 0
-    except Exception:
-        return False
-    finally:
-        sock.close()
+def _jsonrpc_response(payload):
+    """A urlopen() context manager whose response body is ``payload`` as JSON."""
+    response = MagicMock()
+    response.read.return_value = json.dumps(payload).encode("utf-8")
+    context = MagicMock()
+    context.__enter__.return_value = response
+    return context
 
 
 class TestDatabaseDiscovery:
     """Test database discovery and auto-selection functionality."""
+
+    @pytest.fixture(autouse=True)
+    def _web_listing_unreachable(self):
+        """Route listing through the ``/xmlrpc/db`` mocks below.
+
+        ``/web/database/list`` is tried first; making it unreachable keeps these
+        tests off the network and on the fallback they were written for.
+        """
+        with patch("urllib.request.urlopen", side_effect=urllib.error.URLError("unreachable")):
+            yield
 
     @pytest.fixture
     def config(self):
@@ -78,7 +85,7 @@ class TestDatabaseDiscovery:
         mock_proxy.list.side_effect = Exception("Server error")
         connection._db_proxy = mock_proxy
 
-        with pytest.raises(OdooConnectionError, match="Failed to list databases"):
+        with pytest.raises(OdooConnectionError, match="Cannot list databases on this server"):
             connection.list_databases()
 
     def test_database_exists_true(self, connection):
@@ -225,6 +232,43 @@ class TestDatabaseDiscovery:
 
         assert connection.validate_database_access(os.getenv("ODOO_DB", "db")) is False
 
+    def test_list_databases_yolo_access_denied_with_configured_db(self):
+        """Test list_databases falls back to configured db on Access Denied in YOLO mode."""
+        config = OdooConfig(
+            url=os.getenv("ODOO_URL", "http://localhost:8069"),
+            username="admin",
+            password="admin",
+            database="my_configured_db",
+            yolo_mode="true",
+        )
+        conn = OdooConnection(config)
+        conn._connected = True
+        mock_proxy = Mock()
+        mock_proxy.list.side_effect = Fault(1, "Access Denied")
+        conn._db_proxy = mock_proxy
+
+        databases = conn.list_databases()
+
+        assert databases == ["my_configured_db"]
+
+    def test_validate_database_access_no_auth(self):
+        """Test validate_database_access raises when no auth method is configured."""
+        config = OdooConfig(
+            url=os.getenv("ODOO_URL", "http://localhost:8069"),
+            username="admin",
+            password="admin",
+            database=os.getenv("ODOO_DB"),
+        )
+        conn = OdooConnection(config)
+        conn._connected = True
+        # Clear all credentials to reach the "no auth" branch
+        conn.config.api_key = None
+        conn.config.username = None
+        conn.config.password = None
+
+        with pytest.raises(OdooConnectionError, match="No authentication method configured"):
+            conn.validate_database_access("testdb")
+
     def test_validate_database_access_fault(self):
         """Test database validation with XML-RPC fault."""
         config = OdooConfig(
@@ -242,9 +286,93 @@ class TestDatabaseDiscovery:
         assert connection.validate_database_access(os.getenv("ODOO_DB", "db")) is False
 
 
-@pytest.mark.skipif(
-    not is_odoo_server_running(), reason="Odoo server not running at localhost:8069"
-)
+class TestWebDatabaseList:
+    """Database listing through ``/web/database/list``, with ``/xmlrpc/db`` as fallback.
+
+    Odoo 20 removed the ``db`` RPC service: ``/xmlrpc/db`` faults with
+    "Invalid service name: db" there, while the web route exists on 16 to 20.
+    """
+
+    @pytest.fixture
+    def connection(self):
+        config = OdooConfig(url="http://odoo.test:8069", api_key="test_api_key", database=None)
+        conn = OdooConnection(config)
+        conn._connected = True
+        conn._db_proxy = Mock()
+        return conn
+
+    def test_web_route_is_used_first(self, connection):
+        payload = {"jsonrpc": "2.0", "id": None, "result": ["db1", "db2"]}
+        with patch("urllib.request.urlopen", return_value=_jsonrpc_response(payload)) as urlopen:
+            assert connection.list_databases() == ["db1", "db2"]
+
+        request = urlopen.call_args.args[0]
+        assert request.full_url == "http://odoo.test:8069/web/database/list"
+        assert request.get_method() == "POST"
+        assert json.loads(request.data) == {"jsonrpc": "2.0", "method": "call", "params": {}}
+        connection._db_proxy.list.assert_not_called()
+
+    def test_falls_back_to_xmlrpc_db_when_route_is_unreachable(self, connection):
+        connection._db_proxy.list.return_value = ["legacy_db"]
+        with patch("urllib.request.urlopen", side_effect=urllib.error.URLError("blocked")):
+            assert connection.list_databases() == ["legacy_db"]
+
+    def test_falls_back_on_jsonrpc_error(self, connection):
+        # list_db = False: the route answers a JSON-RPC error instead of a list
+        connection._db_proxy.list.return_value = ["legacy_db"]
+        payload = {
+            "jsonrpc": "2.0",
+            "id": None,
+            "error": {
+                "code": 200,
+                "message": "Odoo Server Error",
+                "data": {"name": "odoo.exceptions.AccessDenied", "message": "Access Denied"},
+            },
+        }
+        with patch("urllib.request.urlopen", return_value=_jsonrpc_response(payload)):
+            assert connection.list_databases() == ["legacy_db"]
+        connection._db_proxy.list.assert_called_once()
+
+    def test_falls_back_on_unexpected_body(self, connection):
+        connection._db_proxy.list.return_value = ["legacy_db"]
+        payload = {"success": True, "data": {"valid": True}}
+        with patch("urllib.request.urlopen", return_value=_jsonrpc_response(payload)):
+            assert connection.list_databases() == ["legacy_db"]
+
+    def test_both_routes_failing_asks_for_odoo_db(self, connection):
+        connection._db_proxy.list.side_effect = Fault(1, "ValueError: Invalid service name: db")
+        not_found = urllib.error.HTTPError(
+            "http://odoo.test:8069/web/database/list", 404, "Not Found", {}, None
+        )
+        with patch("urllib.request.urlopen", side_effect=not_found):
+            with pytest.raises(
+                OdooConnectionError,
+                match="Cannot list databases on this server. Set ODOO_DB to the database name.",
+            ):
+                connection.list_databases()
+
+    def test_auto_select_reports_listing_failure(self, connection):
+        connection._db_proxy.list.side_effect = Fault(1, "ValueError: Invalid service name: db")
+        with patch("urllib.request.urlopen", side_effect=urllib.error.URLError("blocked")):
+            with pytest.raises(OdooConnectionError, match="Set ODOO_DB to the database name"):
+                connection.auto_select_database()
+
+    def test_standard_mode_connect_pins_listed_database(self):
+        """connect() in standard mode resolves the database through the web route."""
+        config = OdooConfig(url="http://odoo.test:8069", api_key="test_api_key", database=None)
+        conn = OdooConnection(config)
+        payload = {"jsonrpc": "2.0", "id": None, "result": ["only_db"]}
+        with (
+            patch("urllib.request.urlopen", return_value=_jsonrpc_response(payload)),
+            patch.object(conn, "_test_connection"),
+            patch.object(conn._performance_manager, "set_database") as set_database,
+        ):
+            conn.connect()
+
+        set_database.assert_called_once_with("only_db")
+
+
+@pytest.mark.yolo
 class TestDatabaseDiscoveryIntegration:
     """Integration tests with real Odoo server."""
 
@@ -255,8 +383,11 @@ class TestDatabaseDiscoveryIntegration:
         # Don't load from environment to avoid conflicts
         return OdooConfig(
             url=os.getenv("ODOO_URL", "http://localhost:8069"),
-            api_key=os.getenv("ODOO_API_KEY"),
+            api_key=os.getenv("ODOO_API_KEY") or None,
+            username=os.getenv("ODOO_USER") or None,
+            password=os.getenv("ODOO_PASSWORD") or None,
             database=None,  # Let it auto-select
+            yolo_mode=os.getenv("ODOO_YOLO", "off"),
         )
 
     def test_real_list_databases(self, real_config):
@@ -283,17 +414,25 @@ class TestDatabaseDiscoveryIntegration:
             assert conn.database_exists(selected)
 
     def test_real_validate_access(self, real_config):
-        """Test database access validation on real server."""
+        """Validation grants access to a real database and denies a missing one."""
         with OdooConnection(real_config) as conn:
-            # Get a database to test
             databases = conn.list_databases()
-            if databases:
-                db_name = databases[0]
+            assert databases, "server must expose at least one database"
 
-                # Should be able to validate access
-                result = conn.validate_database_access(db_name)
-                assert isinstance(result, bool)
-                print(f"Access to '{db_name}': {result}")
+            # The auto-selectable database must validate as accessible
+            selected = conn.auto_select_database()
+            assert conn.validate_database_access(selected) is True
+
+            # A nonexistent database must never validate. The API-key path
+            # reports False; the credentials path raises for unknown DBs —
+            # either way access is denied
+            missing = "no_such_database_mcp_test"
+            assert missing not in databases
+            try:
+                result = conn.validate_database_access(missing)
+            except OdooConnectionError:
+                result = False
+            assert result is False
 
 
 if __name__ == "__main__":

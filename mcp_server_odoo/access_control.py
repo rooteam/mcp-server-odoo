@@ -6,13 +6,17 @@ system via REST API endpoints.
 
 import json
 import logging
+import re
+import threading
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from .config import OdooConfig
+from .error_handling import ValidationError
+from .odoo_errors import http_error_message
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +25,39 @@ class AccessControlError(Exception):
     """Exception for access control failures."""
 
     pass
+
+
+class AccessControlModelNotFoundError(AccessControlError):
+    """The MCP module does not know the model (it is not installed)."""
+
+
+class AccessControlUnavailableError(AccessControlError):
+    """Permission could not be EVALUATED (infrastructure failure).
+
+    Distinct from a denial: a network outage or malformed response from
+    the /mcp/ REST endpoints means "could not verify", not "not allowed".
+    Callers should surface these as connection errors (retryable), never
+    as access denials. Still fails closed — operations do not proceed.
+    """
+
+    pass
+
+
+def access_denied_message(error: Exception) -> str:
+    """Prefix an access failure with "Access denied: " unless it already says so.
+
+    The MCP module's own refusals are self-labelling ("Access denied: your
+    user is not authorized for MCP..."), so the unconditional prefix the
+    handlers used produced "Access denied: Access denied: ...". Prefix only
+    when the message does not already open with it. A model the module does
+    not know is not an access problem and gets no prefix.
+    """
+    message = str(error).strip()
+    if isinstance(error, AccessControlModelNotFoundError) or message.lower().startswith(
+        "access denied"
+    ):
+        return message
+    return f"Access denied: {message}"
 
 
 @dataclass
@@ -68,16 +105,35 @@ class AccessController:
     MODELS_ENDPOINT = "/mcp/models"
     MODEL_ACCESS_ENDPOINT = "/mcp/models/{model}/access"
 
-    def __init__(self, config: OdooConfig, cache_ttl: int = CACHE_TTL):
+    def __init__(
+        self,
+        config: OdooConfig,
+        database: Optional[str] = None,
+        cache_ttl: int = CACHE_TTL,
+        auth_method: Optional[str] = None,
+    ):
         """Initialize access controller.
 
         Args:
             config: OdooConfig with connection details and API key
+            database: Resolved database name (needed for session auth when config.database is None)
             cache_ttl: Cache time-to-live in seconds
+            auth_method: How the connection actually authenticated ('api_key'
+                or 'password'). When the configured API key was rejected and
+                the connection fell back to password auth, permission checks
+                must use session auth too — not keep sending the dead key.
         """
         self.config = config
+        self.database = database or config.database
         self.cache_ttl = cache_ttl
+        self.auth_method = auth_method
         self._cache: Dict[str, CacheEntry] = {}
+        self._session_id: Optional[str] = None
+        # Checks run concurrently in asyncio.to_thread workers: the cache
+        # lock keeps entry get/set/clear consistent, the session lock makes
+        # session (re-)authentication single-flight instead of thrashing
+        self._cache_lock = threading.Lock()
+        self._session_lock = threading.Lock()
 
         # Parse base URL
         self.base_url = config.url.rstrip("/")
@@ -91,16 +147,84 @@ class AccessController:
             )
             return  # Skip API validation
 
-        # Validate API key is available for standard mode
-        if not config.api_key:
-            raise AccessControlError(
-                "API key required for access control. Please configure ODOO_API_KEY."
+        if config.api_key:
+            logger.info(f"Initialized AccessController for {self.base_url} (API key auth)")
+        elif config.uses_credentials:
+            logger.info(f"Initialized AccessController for {self.base_url} (session auth)")
+        else:
+            logger.warning(
+                "No authentication configured for MCP access control. "
+                "Set ODOO_API_KEY or provide ODOO_USER/ODOO_PASSWORD."
             )
 
-        logger.info(f"Initialized AccessController for {self.base_url}")
+    def _authenticate_session(self) -> None:
+        """Authenticate via Odoo web session to get a session cookie.
+
+        Used as fallback when no API key is configured.
+
+        Raises:
+            AccessControlError: If session authentication fails
+        """
+        url = f"{self.base_url}/web/session/authenticate"
+        body = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "method": "call",
+                "params": {
+                    "login": self.config.username,
+                    "password": self.config.password,
+                    "db": self.database,
+                },
+                "id": 1,
+            }
+        ).encode()
+
+        req = urllib.request.Request(url, data=body)
+        req.add_header("Content-Type", "application/json")
+
+        try:
+            with urllib.request.urlopen(req, timeout=30) as response:
+                # Extract session_id from Set-Cookie header
+                cookie_header = response.headers.get("Set-Cookie", "")
+                match = re.search(r"session_id=([^;]+)", cookie_header)
+                if not match:
+                    raise AccessControlError(
+                        "Session authentication failed: no session cookie returned"
+                    )
+
+                self._session_id = match.group(1)
+
+                # Verify the response indicates success (no JSON-RPC error)
+                data = json.loads(response.read().decode("utf-8"))
+                if "error" in data:
+                    self._session_id = None
+                    raise AccessControlError("Session authentication failed: invalid credentials")
+
+                logger.info("Session authentication successful")
+
+        except urllib.error.HTTPError as e:
+            raise AccessControlError(f"Session authentication failed: HTTP {e.code}") from e
+        except urllib.error.URLError as e:
+            raise AccessControlError(f"Session authentication failed: {e.reason}") from e
+
+    def _ensure_session(self) -> Optional[str]:
+        """Ensure a valid session exists and RETURN its id.
+
+        The id must be read under the same lock that creates it: a concurrent
+        401 handler nulls ``self._session_id`` while holding the lock, so a
+        caller that re-read the attribute afterwards could interleave and send
+        the literal header ``Cookie: session_id=None``.
+        """
+        with self._session_lock:
+            if not self._session_id:
+                self._authenticate_session()
+            return self._session_id
 
     def _make_request(self, endpoint: str, timeout: int = 30) -> Dict[str, Any]:
         """Make authenticated request to MCP REST API.
+
+        Uses API key if available, otherwise falls back to session cookie auth.
+        On session 401, retries once after re-authenticating.
 
         Args:
             endpoint: API endpoint path
@@ -112,12 +236,39 @@ class AccessController:
         Raises:
             AccessControlError: If request fails
         """
-        url = f"{self.base_url}{endpoint}"
+        return self._do_request(endpoint, timeout, allow_session_retry=True)
 
-        # Create request with API key header
+    def _do_request(self, endpoint: str, timeout: int, allow_session_retry: bool) -> Dict[str, Any]:
+        """Internal request method with optional session retry.
+
+        Args:
+            endpoint: API endpoint path
+            timeout: Request timeout in seconds
+            allow_session_retry: Whether to retry with a fresh session on 401
+
+        Returns:
+            Parsed JSON response
+
+        Raises:
+            AccessControlError: If request fails
+        """
+        url = f"{self.base_url}{endpoint}"
+        uses_session = False
+
         req = urllib.request.Request(url)
-        req.add_header("X-API-Key", self.config.api_key)
+        # Use the API key only when the connection actually authenticated
+        # with it (or auth_method is unknown). After a password fallback the
+        # configured key is known-rejected — sending it would 401 every check.
+        use_api_key = self.config.api_key and self.auth_method != "password"
+        if use_api_key:
+            req.add_header("X-API-Key", self.config.api_key)
+        elif self.config.uses_credentials:
+            session_id = self._ensure_session()
+            req.add_header("Cookie", f"session_id={session_id}")
+            uses_session = True
         req.add_header("Accept", "application/json")
+        if self.database:
+            req.add_header("X-Odoo-Database", self.database)
 
         try:
             logger.debug(f"Making request to {url}")
@@ -134,47 +285,78 @@ class AccessController:
 
         except urllib.error.HTTPError as e:
             if e.code == 401:
-                raise AccessControlError("Invalid API key for access control") from e
+                # Session expired — retry once with a fresh session
+                if uses_session and allow_session_retry:
+                    logger.info("Session expired, re-authenticating...")
+                    with self._session_lock:
+                        self._session_id = None
+                    return self._do_request(endpoint, timeout, allow_session_retry=False)
+
+                if use_api_key:
+                    raise AccessControlError(
+                        "API key rejected by MCP module. "
+                        "Verify ODOO_API_KEY is valid and the MCP module is installed."
+                    ) from e
+                raise AccessControlError(
+                    "MCP REST API authentication failed. "
+                    "Configure ODOO_API_KEY or use YOLO mode (ODOO_YOLO=read)."
+                ) from e
             elif e.code == 403:
-                raise AccessControlError("Access denied to MCP endpoints") from e
+                # The module explains exactly what was refused ("Model 'x' is
+                # not enabled for MCP access."); a generic message here sends
+                # users hunting a credential problem that does not exist.
+                raise AccessControlError(
+                    http_error_message(e) or "Access denied to MCP endpoints"
+                ) from e
             elif e.code == 404:
-                raise AccessControlError(f"Endpoint not found: {endpoint}") from e
+                # The module answers an unknown model with its own 404 message
+                # ("Model 'x' not found in Odoo instance."). A 404 without it
+                # means the endpoint itself is missing.
+                message = http_error_message(e)
+                if message:
+                    raise AccessControlModelNotFoundError(message) from e
+                raise AccessControlUnavailableError(f"Endpoint not found: {endpoint}") from e
             else:
-                raise AccessControlError(f"HTTP error {e.code}: {e.reason}") from e
+                raise AccessControlUnavailableError(f"HTTP error {e.code}: {e.reason}") from e
         except urllib.error.URLError as e:
-            raise AccessControlError(f"Connection error: {e.reason}") from e
+            raise AccessControlUnavailableError(f"Connection error: {e.reason}") from e
         except json.JSONDecodeError as e:
-            raise AccessControlError(f"Invalid JSON response: {e}") from e
+            raise AccessControlUnavailableError(f"Invalid JSON response: {e}") from e
+        except AccessControlError:
+            raise
         except Exception as e:
-            raise AccessControlError(f"Request failed: {e}") from e
+            raise AccessControlUnavailableError(f"Request failed: {e}") from e
 
     def _get_from_cache(self, key: str) -> Optional[Any]:
         """Get value from cache if not expired."""
-        if key in self._cache:
-            entry = self._cache[key]
-            if not entry.is_expired(self.cache_ttl):
-                logger.debug(f"Cache hit for {key}")
-                return entry.data
-            else:
-                logger.debug(f"Cache expired for {key}")
-                del self._cache[key]
+        with self._cache_lock:
+            if key in self._cache:
+                entry = self._cache[key]
+                if not entry.is_expired(self.cache_ttl):
+                    logger.debug(f"Cache hit for {key}")
+                    return entry.data
+                else:
+                    logger.debug(f"Cache expired for {key}")
+                    del self._cache[key]
         return None
 
     def _set_cache(self, key: str, data: Any) -> None:
         """Set value in cache."""
-        self._cache[key] = CacheEntry(data=data, timestamp=datetime.now())
+        with self._cache_lock:
+            self._cache[key] = CacheEntry(data=data, timestamp=datetime.now())
         logger.debug(f"Cached {key}")
 
     def clear_cache(self) -> None:
         """Clear all cached data."""
-        self._cache.clear()
+        with self._cache_lock:
+            self._cache.clear()
         logger.info("Cleared access control cache")
 
     def get_enabled_models(self) -> List[Dict[str, str]]:
         """Get list of all MCP-enabled models.
 
         Returns:
-            List of dicts with 'model' and 'name' keys
+            List of dicts with 'model' and 'name' keys (newer MCP modules add 'operations')
 
         Raises:
             AccessControlError: If request fails
@@ -297,7 +479,6 @@ class AccessController:
         """
         # In YOLO mode, check based on mode level
         if self.config.is_yolo_enabled:
-            # Define read operations
             read_operations = {
                 "read",
                 "search",
@@ -307,12 +488,9 @@ class AccessController:
                 "search_count",
             }
 
-            # Check operation based on mode
             if operation in read_operations:
-                # Read operations always allowed in YOLO mode
                 return True, None
             elif self.config.yolo_mode == "true":
-                # All operations allowed in full mode
                 return True, None
             else:
                 # Write operations blocked in read-only mode
@@ -335,6 +513,12 @@ class AccessController:
 
             return True, None
 
+        except (AccessControlUnavailableError, AccessControlModelNotFoundError):
+            # Infrastructure failure — propagate so callers report a
+            # connection problem (retryable), not a permission denial. A model
+            # the module does not know propagates too, so that it is not
+            # reported as "Access denied".
+            raise
         except AccessControlError as e:
             logger.error(f"Access control check failed: {e}")
             return False, str(e)
@@ -397,3 +581,282 @@ class AccessController:
             logger.error(f"Failed to get all permissions: {e}")
 
         return permissions
+
+
+def check_domain_balance(domain: List[Any], path: str = "domain") -> None:
+    """Reject a domain whose prefix operators have no operands of their own.
+
+    Odoo joins a flat sequence of expressions with implicit ANDs, which is why
+    the ir.attachment scope is appended rather than prefixed with an explicit
+    "&". That only holds while the caller's own domain is balanced: the
+    trailing "|" in ``["|", ("id", ">", 0)]`` would otherwise take the appended
+    scope as its second operand, ORing the allowlist away instead of ANDing it
+    in. Such a payload is invalid on its own — Odoo rejects it — and becomes
+    well-formed only once the scope is concatenated, so nothing downstream
+    catches it.
+    """
+    expected = 1
+    for index, token in enumerate(domain):
+        if expected == 0:
+            # Odoo prepends an implicit "&" for a flat sequence of terms.
+            expected = 1
+        if isinstance(token, (list, tuple)):
+            if len(token) != 3:
+                raise ValidationError(
+                    f"Invalid domain condition {list(token)!r} at {path}[{index}]: a "
+                    "condition has three parts, ['field', 'operator', value]"
+                )
+            expected -= 1
+        elif token == "!":
+            # Unary: consumes one expression and yields one.
+            continue
+        elif token in ("&", "|"):
+            expected += 1
+        else:
+            raise ValidationError(
+                f"Invalid domain term {token!r} at {path}[{index}]: expected a "
+                f"condition like ['field', '=', value] or one of '&', '|', '!'"
+            )
+    if domain and expected:
+        raise ValidationError(
+            f"Unbalanced {path}: its '&'/'|'/'!' operators need {expected} more condition(s)"
+        )
+
+
+# Models whose rows belong to a document of another model, mapped to the
+# domain path that names that model. Enabling one of them must not expose the
+# rows of every model: an attachment carries url and index_content (the
+# extracted document text), a message its body, a tracking value the old and
+# new values of a tracked field. A tracking value or a notification belongs
+# to the document of its message.
+DOCUMENT_LINKS: Dict[str, str] = {
+    "ir.attachment": "res_model",
+    "mail.message": "model",
+    "mail.mail": "model",
+    "mail.followers": "res_model",
+    "mail.activity": "res_model",
+    "mail.tracking.value": "mail_message_id.model",
+    "mail.notification": "mail_message_id.model",
+}
+
+
+# How the gates name a row of a DOCUMENT_LINKS model in a refusal
+DOCUMENT_NOUNS: Dict[str, str] = {
+    "ir.attachment": "attachment",
+    "mail.message": "message",
+    "mail.mail": "email",
+    "mail.followers": "follower",
+    "mail.activity": "activity",
+    "mail.tracking.value": "tracking value",
+    "mail.notification": "notification",
+}
+
+
+def document_scope_domain(
+    model: str,
+    config: OdooConfig,
+    access_controller: "AccessController",
+    operation: str = "read",
+) -> Optional[List[Any]]:
+    """Domain restricting a DOCUMENT_LINKS model to MCP-accessible owners.
+
+    Searches and reads of these models are scoped here instead of
+    post-filtering rows: a domain keeps `search_count` and the pagination math
+    consistent with what is actually returned.
+
+    Lives here rather than beside its callers: the tool and resource handlers
+    both need it, and an allowlist-derived domain belongs with the allowlist.
+
+    Scoped to owner models that allow `operation`, not merely ones that are
+    enabled: the two are separate endpoints, and an enabled-but-unreadable
+    model whose rows were admitted here would sidestep
+    `validate_model_access`.
+
+    Fails CLOSED, like every other gate on this path: an unreadable allowlist
+    propagates as AccessControlError so the caller sees a retryable "could not
+    verify access" instead of an unscoped result set. Swallowing the error
+    would silently disable the scope on every surface at once, which is the
+    one outcome a security control must not have. Returns None when scoping
+    does not apply: YOLO mode allows every model, and other models have no
+    owner.
+
+    Raises:
+        AccessControlError: If the enabled-model listing or a per-model
+            permission cannot be retrieved.
+    """
+    link = DOCUMENT_LINKS.get(model)
+    if config.is_yolo_enabled or not link:
+        return None
+    enabled = access_controller.get_enabled_models()
+    names = []
+    for entry in enabled:
+        owner = entry.get("model")
+        if not owner:
+            continue
+        # Enablement and the per-operation permission are different endpoints
+        # (/mcp/models vs /mcp/models/{model}/access), so an enabled model may
+        # still refuse the operation, and admitting it here would expose
+        # exactly the rows the gate exists to withhold.
+        operations = entry.get("operations") or {}
+        if operations:
+            # Newer MCP modules ship the flags in the listing itself — free.
+            if operations.get(operation):
+                names.append(owner)
+            continue
+        # Older modules return only {model, name}. Neither default is safe:
+        # True admits rows the caller cannot reach, False hides ones it can,
+        # so resolve it. The per-model cache is shared with list_models, so
+        # this is usually already warm; an unresolvable permission raises
+        # AccessControlError and fails closed like the listing above.
+        if access_controller.get_model_permissions(owner).can_perform(operation):
+            names.append(owner)
+    if not names:
+        # Standard mode with nothing enabled: only rows without an owner can
+        # qualify. Contradictory state (the model's own gate already passed),
+        # but the fail-closed reading is the safe one.
+        return [(link, "=", False)]
+    # Rows without an owner (a standalone attachment) stay governed by the
+    # model's own gate alone, exactly as the payload readers treat them.
+    return ["|", (link, "=", False), (link, "in", names)]
+
+
+def document_owners(
+    connection: Any, model: str, record_ids: Iterable[int]
+) -> List[Tuple[int, Optional[str]]]:
+    """Return (id, owner model) for each existing row of a DOCUMENT_LINKS model.
+
+    Blocking. A tracking value or a notification belongs to the owner of its
+    message, so that one extra read follows the message. Archived rows count:
+    an archived attachment still holds its document.
+    """
+    link = DOCUMENT_LINKS[model]
+    field = link.split(".")[0]
+    rows = connection.search_read(
+        model,
+        [["id", "in", list(record_ids)]],
+        [field],
+        context={"active_test": False},
+    )
+    if "." not in link:
+        return [(row["id"], row.get(field) or None) for row in rows]
+    message_ids = {}
+    for row in rows:
+        value = row.get(field)
+        if value:
+            message_ids[row["id"]] = value[0] if isinstance(value, (list, tuple)) else value
+    owners = (
+        dict(document_owners(connection, "mail.message", set(message_ids.values())))
+        if message_ids
+        else {}
+    )
+    return [(row["id"], owners.get(message_ids.get(row["id"]))) for row in rows]
+
+
+def check_related_paths(
+    connection: Any,
+    access_controller: "AccessController",
+    config: OdooConfig,
+    model: str,
+    domain: Optional[Sequence[Any]] = None,
+    groupby: Optional[Sequence[str]] = None,
+    order: Optional[str] = None,
+) -> None:
+    """Refuse a read that reaches a model MCP refuses through a relation (blocking).
+
+    A condition such as ``user_ids.groups_id.name`` filters on res.groups, and
+    an ``any`` sub-domain or a condition on an x2many by name does the same,
+    while the allowlist was only asked about the model searched. A client that
+    cannot read res.groups could still test its values one guess at a time.
+    Grouping by an x2many lists the names of the related records, which record
+    reads withhold for a model that is not readable. Every relation a path
+    passes through must allow reads. A many2one at the end of a path stays
+    allowed: record reads show its name too. Unknown fields are left to Odoo,
+    which refuses them.
+    """
+    if config.is_yolo_enabled:
+        return
+    walker = _PathWalker(connection, access_controller)
+    if domain:
+        walker.domain(model, domain)
+    for spec in groupby or ():
+        if isinstance(spec, str):
+            name = spec.split(":")[0].strip()
+            end = walker.walk(model, name, "grouping by")
+            if end and end.get("type") in ("one2many", "many2many"):
+                walker.require(end.get("relation"), name, "grouping by")
+    for term in (order or "").split(","):
+        words = term.split()
+        name = words[0].split(":")[0] if words else ""
+        if name and not name.startswith("__"):
+            walker.walk(model, name, "ordering by")
+
+
+class _PathWalker:
+    def __init__(self, connection: Any, access_controller: "AccessController"):
+        self.connection = connection
+        self.access_controller = access_controller
+
+    def domain(self, model: str, domain: Sequence[Any]) -> None:
+        for leaf in domain:
+            if not (isinstance(leaf, (list, tuple)) and len(leaf) == 3):
+                continue
+            path, operator, value = leaf
+            if not isinstance(path, str):
+                continue
+            end = self.walk(model, path, "the condition on")
+            if not end:
+                continue
+            relation = end.get("relation")
+            if end.get("type") not in ("many2one", "one2many", "many2many") or not relation:
+                continue
+            if operator in ("any", "not any"):
+                self.require(relation, path, "the condition on")
+                if isinstance(value, (list, tuple)):
+                    self.domain(relation, value)
+            elif end.get("type") != "many2one" and not _ids_only(value):
+                # A name on an x2many runs a name search on the related model
+                self.require(relation, path, "the condition on")
+
+    def walk(self, model: str, path: str, usage: str) -> Optional[Dict[str, Any]]:
+        """Check each relation a dotted path passes through; return the last field."""
+        current = model
+        segments = path.split(".")
+        for index, segment in enumerate(segments):
+            try:
+                fields = self.connection.fields_get(current)
+            except Exception:
+                return None  # Odoo answers the condition itself
+            meta = fields.get(segment) if isinstance(fields, dict) else None
+            if not isinstance(meta, dict):
+                return None
+            if index == len(segments) - 1:
+                return meta
+            relation = meta.get("relation")
+            if not relation:
+                return None  # A path into a properties or json field
+            self.require(relation, path, usage)
+            current = relation
+        return None
+
+    def require(self, relation: Optional[str], path: str, usage: str) -> None:
+        if not relation:
+            return
+        try:
+            self.access_controller.validate_model_access(relation, "read")
+        except AccessControlUnavailableError:
+            raise
+        except AccessControlError as e:
+            raise ValidationError(
+                f"Access denied: {usage} '{path}' reads {relation}, which is not accessible via MCP"
+            ) from e
+
+
+def _ids_only(value: Any) -> bool:
+    """Whether a condition value names records by id only (no name search)."""
+    if value is None or isinstance(value, bool):
+        return True
+    if isinstance(value, int):
+        return True
+    if isinstance(value, (list, tuple)):
+        return all(isinstance(v, int) and not isinstance(v, bool) for v in value)
+    return False

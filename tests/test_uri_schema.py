@@ -6,9 +6,9 @@ from mcp_server_odoo.uri_schema import (
     OdooOperation,
     URIParseError,
     URIValidationError,
+    build_binary_uri,
     build_pagination_uri,
     build_record_uri,
-    build_search_uri,
     build_uri,
     extract_model_from_uri,
     parse_uri,
@@ -64,15 +64,6 @@ class TestURIParsing:
         assert parsed.limit == 10
         assert parsed.offset == 20
         assert parsed.order == "date_order desc"
-
-    def test_parse_browse_uri(self):
-        """Test parsing browse URIs."""
-        uri = "odoo://res.partner/browse?ids=1,2,3,4"
-        parsed = parse_uri(uri)
-
-        assert parsed.model == "res.partner"
-        assert parsed.operation == OdooOperation.BROWSE
-        assert parsed.ids == [1, 2, 3, 4]
 
     def test_parse_count_uri(self):
         """Test parsing count URIs."""
@@ -141,11 +132,6 @@ class TestURIParsing:
         with pytest.raises(URIValidationError, match="Record operation requires an ID"):
             parse_uri("odoo://res.partner/record")
 
-    def test_parse_uri_browse_without_ids(self):
-        """Test parsing browse URIs without IDs parameter."""
-        with pytest.raises(URIValidationError, match="Browse operation requires 'ids' parameter"):
-            parse_uri("odoo://res.partner/browse")
-
     def test_parse_uri_invalid_limit(self):
         """Test parsing URIs with invalid limit parameter."""
         with pytest.raises(URIValidationError, match="Invalid limit value"):
@@ -158,11 +144,6 @@ class TestURIParsing:
         """Test parsing URIs with invalid offset parameter."""
         with pytest.raises(URIValidationError, match="Invalid offset value"):
             parse_uri("odoo://res.partner/search?offset=xyz")
-
-    def test_parse_uri_invalid_ids(self):
-        """Test parsing URIs with invalid IDs parameter."""
-        with pytest.raises(URIValidationError, match="Invalid IDs parameter"):
-            parse_uri("odoo://res.partner/browse?ids=1,abc,3")
 
     def test_odoo_uri_to_uri(self):
         """Test converting OdooURI back to string."""
@@ -189,12 +170,12 @@ class TestURIBuilding:
         uri = build_uri("res.partner", "record", record_id=42)
         assert uri == "odoo://res.partner/record/42"
 
-    def test_build_search_uri_simple(self):
+    def test_build_uri_search_simple(self):
         """Test building simple search URIs."""
         uri = build_uri("product.product", "search")
         assert uri == "odoo://product.product/search"
 
-    def test_build_search_uri_with_domain(self):
+    def test_build_uri_search_with_domain(self):
         """Test building search URIs with domain."""
         uri = build_uri("res.partner", "search", domain="[('is_company','=',True)]")
         assert (
@@ -202,7 +183,7 @@ class TestURIBuilding:
             == "odoo://res.partner/search?domain=%5B%28%27is_company%27%2C%27%3D%27%2CTrue%29%5D"
         )
 
-    def test_build_search_uri_with_all_params(self):
+    def test_build_uri_search_with_all_params(self):
         """Test building search URIs with all parameters."""
         uri = build_uri(
             "sale.order",
@@ -222,11 +203,6 @@ class TestURIBuilding:
         assert parsed.limit == 25
         assert parsed.offset == 50
         assert parsed.order == "date_order desc"
-
-    def test_build_browse_uri(self):
-        """Test building browse URIs."""
-        uri = build_uri("res.partner", "browse", ids=[1, 2, 3, 4])
-        assert "odoo://res.partner/browse?ids=1%2C2%2C3%2C4" == uri
 
     def test_build_count_uri(self):
         """Test building count URIs."""
@@ -258,19 +234,6 @@ class TestURIBuilding:
 
 class TestURIConvenienceFunctions:
     """Test convenience functions for URI building."""
-
-    def test_build_search_uri_convenience(self):
-        """Test the build_search_uri convenience function."""
-        uri = build_search_uri(
-            "res.partner", domain="[('is_company','=',True)]", fields=["name", "email"], limit=20
-        )
-
-        parsed = parse_uri(uri)
-        assert parsed.model == "res.partner"
-        assert parsed.operation == OdooOperation.SEARCH
-        assert parsed.domain == "[('is_company','=',True)]"
-        assert parsed.fields == ["name", "email"]
-        assert parsed.limit == 20
 
     def test_build_record_uri_convenience(self):
         """Test the build_record_uri convenience function."""
@@ -338,15 +301,6 @@ class TestURIRoundTrip:
         assert reparsed.offset == parsed.offset
         assert reparsed.order == parsed.order
 
-    def test_roundtrip_browse(self):
-        """Test browse URI round-trip."""
-        original = build_uri("product.product", "browse", ids=[10, 20, 30, 40, 50])
-        parsed = parse_uri(original)
-        rebuilt = parsed.to_uri()
-        reparsed = parse_uri(rebuilt)
-
-        assert reparsed.ids == parsed.ids
-
 
 class TestURIEdgeCases:
     """Test edge cases and special scenarios."""
@@ -387,10 +341,15 @@ class TestURIEdgeCases:
         parsed = parse_uri(uri)
         assert parsed.record_id == 999999999
 
-    def test_browse_with_many_ids(self):
-        """Test browse with many IDs."""
-        ids = list(range(1, 101))  # 100 IDs
-        uri = build_uri("res.partner", "browse", ids=ids)
-        parsed = parse_uri(uri)
-        assert parsed.ids == ids
-        assert len(parsed.ids) == 100
+
+class TestAttachmentContentFieldsShareTheAttachmentUri:
+    """``datas`` is gone on Odoo 20; ``raw`` and ``db_datas`` hold the same content."""
+
+    @pytest.mark.parametrize("field", ["datas", "raw", "db_datas"])
+    def test_content_fields_map_to_the_attachment_uri(self, field):
+        assert build_binary_uri("ir.attachment", 5, field) == "odoo://attachment/5"
+
+    def test_other_attachment_binary_keeps_the_field_uri(self):
+        assert build_binary_uri("ir.attachment", 5, "thumbnail") == (
+            "odoo://ir.attachment/record/5/thumbnail"
+        )

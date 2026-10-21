@@ -4,13 +4,26 @@ This module provides formatters that convert Odoo data into
 hierarchical text format optimized for LLM consumption.
 """
 
+import json
 import logging
+import xmlrpc.client
 from datetime import date, datetime
 from typing import Any, Dict, List, Optional, Set
 
-from .uri_schema import build_record_uri, build_search_uri
+from .uri_schema import (
+    BINARY_FIELD_TYPES,
+    build_binary_uri,
+    build_record_uri,
+    is_binary_payload_dict,
+)
 
 logger = logging.getLogger(__name__)
+
+# x2many preview cap, shared with the tools' inline related-summary
+# resolution: a collection holding at most this many items gets expanded
+# inline (formatter) / its display names resolved (get_record tool). Kept
+# low so the extra reads stay cheap and the output short.
+MAX_RELATED_ITEMS = 5
 
 
 class RecordFormatter:
@@ -32,10 +45,26 @@ class RecordFormatter:
         "message_main_attachment_id",
     }
 
-    # Binary field types
-    BINARY_FIELDS = {"binary", "image", "file"}
+    # Binary field types — kept in lockstep with the shared tuple so the
+    # formatter never emits a fetchable binary URI for a type the resource
+    # handler would reject (e.g. the non-ORM "file").
+    BINARY_FIELDS = frozenset(BINARY_FIELD_TYPES)
 
-    def __init__(self, model: str, max_related_items: int = 5):
+    # Binary-LIKE field types NOT served by the binary resource (non-core
+    # types, e.g. OCA modules' "file"): no fetchable URI exists for them, so
+    # their values render as a placeholder — falling through to the
+    # unknown-type branch would dump up to 2000 chars of raw base64.
+    _BINARY_LIKE_UNSERVED = ("file",)
+
+    # Per-field display cap — long values (pasted documents, base64 blobs)
+    # are truncated with an explicit marker to protect the LLM context
+    MAX_FIELD_DISPLAY_LENGTH = 2000
+
+    # A bin_size read delivers a short human-readable placeholder (e.g.
+    # "12.5 KB"); anything longer is a raw base64 blob and is omitted.
+    MAX_BINARY_PLACEHOLDER_LENGTH = 32
+
+    def __init__(self, model: str, max_related_items: int = MAX_RELATED_ITEMS):
         """Initialize the formatter.
 
         Args:
@@ -65,9 +94,10 @@ class RecordFormatter:
         lines = []
         indent = "  " * indent_level
 
-        # Record header
+        # Record header. Odoo returns False (not None) for unset char
+        # fields, so chain with `or` instead of relying on .get defaults.
         record_id = record.get("id", "Unknown")
-        record_name = record.get("display_name") or record.get("name", f"Record {record_id}")
+        record_name = record.get("display_name") or record.get("name") or f"Record {record_id}"
 
         lines.append(f"{indent}{'=' * 50}")
         lines.append(f"{indent}Record: {self.model}/{record_id}")
@@ -97,12 +127,15 @@ class RecordFormatter:
             else:
                 simple_fields.append((field_name, field_value, field_meta))
 
+        # Record ID for building binary-field resource URIs
+        record_id_int = record_id if isinstance(record_id, int) and record_id > 0 else None
+
         # Format simple fields first
         if simple_fields:
             lines.append(f"{indent}Fields:")
             for field_name, field_value, field_meta in simple_fields:
                 formatted_value = self._format_field_value(
-                    field_name, field_value, field_meta, indent_level + 1
+                    field_name, field_value, field_meta, indent_level + 1, record_id_int
                 )
                 lines.append(f"{indent}  {field_name}: {formatted_value}")
 
@@ -112,7 +145,11 @@ class RecordFormatter:
             for field_name, field_value, field_meta in relation_fields:
                 lines.extend(
                     self._format_relation_field(
-                        field_name, field_value, field_meta, indent_level + 1
+                        field_name,
+                        field_value,
+                        field_meta,
+                        indent_level + 1,
+                        parent_id=record_id_int,
                     )
                 )
 
@@ -144,7 +181,12 @@ class RecordFormatter:
         return "\n".join(lines)
 
     def _format_field_value(
-        self, field_name: str, value: Any, field_meta: Dict[str, Any], indent_level: int
+        self,
+        field_name: str,
+        value: Any,
+        field_meta: Dict[str, Any],
+        indent_level: int,
+        record_id: Optional[int] = None,
     ) -> str:
         """Format a field value based on its type.
 
@@ -153,29 +195,33 @@ class RecordFormatter:
             value: The field value
             field_meta: Field metadata
             indent_level: Current indentation level
+            record_id: Record ID, used to build binary-field resource URIs
 
         Returns:
             Formatted field value
         """
+        field_type = field_meta.get("type", "unknown")
+        if field_type == "boolean":
+            return "Yes" if value else "No"
         if value is None or value is False:
             return "Not set"
 
-        field_type = field_meta.get("type", "unknown")
-
         # Text fields
         if field_type in ("char", "text", "html"):
-            return str(value)
+            return self._truncate_value(str(value))
 
         # Numeric fields
         elif field_type in ("integer", "float", "monetary"):
             if field_type == "monetary":
                 # Try to get currency information
                 # TODO: Use currency_field to get proper currency formatting
-                # currency_field = field_meta.get("currency_field", "currency_id")
                 return f"{value:,.2f}"  # Format with thousand separators
             elif field_type == "float":
+                # XML-RPC unmarshals Odoo's digits tuple as a list
                 digits = field_meta.get("digits", (16, 2))
-                precision = digits[1] if isinstance(digits, tuple) else 2
+                precision = (
+                    digits[1] if isinstance(digits, (tuple, list)) and len(digits) == 2 else 2
+                )
                 return f"{value:,.{precision}f}"
             else:
                 return f"{value:,}"  # Integer with thousand separators
@@ -228,16 +274,76 @@ class RecordFormatter:
                     return f"{label} ({value})"
             return str(value)
 
-        # Binary fields
+        # Binary fields: point at the fetchable resource URI instead of the
+        # value ("Not set" for empty binaries is handled by the falsy check
+        # above). Reads with bin_size=True deliver a short size placeholder
+        # (e.g. "12.5 KB") — append it; long values (raw base64) are omitted.
+        # ir.attachment.datas gets the attachment-specific URI so its stored
+        # mimetype and type='url' handling apply on read.
         elif field_type in self.BINARY_FIELDS:
-            return f"[Binary data - use {self.model}/{field_name} to retrieve]"
+            # Only an actual payload earns a URI. The binary resource can
+            # serve a base64 str, raw bytes or an xmlrpc Binary (see
+            # resources._decode_binary_value) — anything else is not binary
+            # data at all. Odoo declares several non-stored widget fields as
+            # Binary while returning a dict (sale.order.tax_totals,
+            # account.move.invoice_payments_widget, needed_terms,
+            # payment_term_details); bin_size does not apply to them, so
+            # emitting a URI would drop the payload AND advertise a link whose
+            # read fails with "Unexpected binary value type: dict". Mirrors
+            # the guard in tools._replace_binary_values. Odoo 20's
+            # {content, size} read shape is the one dict that is a payload.
+            if not is_binary_payload_dict(value) and not isinstance(
+                value, (str, bytes, bytearray, xmlrpc.client.Binary)
+            ):
+                return self._truncate_value(str(value))
+            if record_id is None:
+                return "[Binary data]"
+            # No URIValidationError guard here, unlike the tools' copy:
+            # leading-underscore field names are filtered by format_record
+            # before the type dispatch, though the URI grammar would also
+            # reject non-ASCII identifiers. record_id is already a validated
+            # positive int, and self.model reached the formatter by surviving
+            # a real Odoo query.
+            uri = build_binary_uri(self.model, record_id, field_name)
+            # Only a bin_size read yields a short size placeholder to append.
+            if isinstance(value, str) and len(value) <= self.MAX_BINARY_PLACEHOLDER_LENGTH:
+                return f"{uri} ({value})"
+            return uri
 
-        # Unknown type
+        # Binary-like types the binary resource does not serve (non-core,
+        # e.g. "file"): a placeholder without a URI — the URI would be
+        # rejected on read, and the raw value is base64, not prose.
+        elif field_type in self._BINARY_LIKE_UNSERVED:
+            return "[Binary data]"
+
+        # Unknown type (typically: field metadata unavailable)
         else:
-            return str(value)
+            # Render many2one-shaped values readably instead of as a raw repr
+            if (
+                isinstance(value, (list, tuple))
+                and len(value) == 2
+                and isinstance(value[0], int)
+                and isinstance(value[1], str)
+            ):
+                return f"{value[1]} (ID: {value[0]})"
+            # Cap long values (e.g. base64 blobs read without metadata)
+            return self._truncate_value(str(value))
+
+    def _truncate_value(self, text: str) -> str:
+        """Cap a formatted value to keep responses LLM-context friendly."""
+        if len(text) > self.MAX_FIELD_DISPLAY_LENGTH:
+            return (
+                text[: self.MAX_FIELD_DISPLAY_LENGTH] + f"... [truncated, {len(text)} chars total]"
+            )
+        return text
 
     def _format_relation_field(
-        self, field_name: str, value: Any, field_meta: Dict[str, Any], indent_level: int
+        self,
+        field_name: str,
+        value: Any,
+        field_meta: Dict[str, Any],
+        indent_level: int,
+        parent_id: Optional[int] = None,
     ) -> List[str]:
         """Format a relationship field.
 
@@ -246,6 +352,9 @@ class RecordFormatter:
             value: The field value
             field_meta: Field metadata
             indent_level: Current indentation level
+            parent_id: ID of the record holding the field — lets a one2many
+                with a clean dedicated inverse (no field-level domain) hint a
+                "view all" filter on that inverse instead of an id-in domain
 
         Returns:
             List of formatted lines
@@ -270,19 +379,54 @@ class RecordFormatter:
                 count = len(value)
                 related_model = field_meta.get("relation", "unknown")
 
-                # Build search URI for the related records
-                if field_type == "one2many":
-                    # For one2many, search by the inverse field
-                    inverse_field = field_meta.get("relation_field", "parent_id")
-                    domain = [(inverse_field, "=", self._get_current_record_id())]
-                else:
-                    # For many2many, we'd need the actual IDs
-                    domain = [("id", "in", value)] if value else []
-
-                search_uri = build_search_uri(related_model, domain=domain)
-
                 lines.append(f"{indent}{field_name}: {count} record(s)")
-                lines.append(f"{indent}  → View all: {search_uri}")
+
+                # Point at the search_records tool — resource URIs cannot
+                # carry query parameters, so emitting odoo://...?domain=...
+                # links would produce dead links.
+                related_ids = [
+                    item["id"] if isinstance(item, dict) else item
+                    for item in value
+                    if isinstance(item, (int, dict))
+                ]
+                if related_ids and related_model != "unknown":
+                    relation_field = field_meta.get("relation_field")
+                    if (
+                        field_type == "one2many"
+                        and relation_field
+                        and relation_field != "res_id"
+                        and not field_meta.get("domain")
+                        and isinstance(parent_id, int)
+                    ):
+                        # A one2many with a clean dedicated inverse is exactly
+                        # the records whose inverse many2one points back here
+                        # — filtering on it returns the whole collection with
+                        # a compact domain (no id cap). Only when the field
+                        # declares no domain of its own: a domain-restricted
+                        # o2m (e.g. account.move.invoice_line_ids excludes
+                        # tax/payment-term lines) holds a SUBSET of the
+                        # inverse-pointing records, so the inverse-only search
+                        # would over-return. Any truthy `domain` (a list, or a
+                        # string for dynamic domains) disqualifies the hint.
+                        domain_str = json.dumps([[relation_field, "=", parent_id]])
+                        suffix = ""
+                    else:
+                        # many2many (no scalar inverse), a one2many without
+                        # one, a domain-restricted one2many (see above), or a
+                        # generic `res_id` inverse (mail.message /
+                        # mail.activity / ir.attachment-style fields such as
+                        # message_ids): a bare res_id domain would need a
+                        # res_model constraint the formatter has no metadata
+                        # for and would match every model's records with that
+                        # id — fall back to an id-in domain, capped so the
+                        # hint stays bounded.
+                        shown_ids = related_ids[:50]
+                        domain_str = json.dumps([["id", "in", shown_ids]])
+                        suffix = " (first 50 ids)" if len(related_ids) > 50 else ""
+                    lines.append(
+                        f"{indent}  → View all: use the search_records tool with "
+                        f"model='{related_model}', domain={domain_str}{suffix}"
+                    )
 
                 # Show first few items if count is small
                 if count <= self.max_related_items and isinstance(value[0], dict):
@@ -322,17 +466,6 @@ class RecordFormatter:
         # Fallback to ID
         return f"ID: {record.get('id', 'Unknown')}"
 
-    def _get_current_record_id(self) -> Optional[int]:
-        """Get the current record ID being formatted.
-
-        This is a placeholder that should be set when formatting a specific record.
-
-        Returns:
-            Current record ID or None
-        """
-        # This would be set by the formatting context
-        return None
-
 
 class DatasetFormatter:
     """Formats datasets and search results for LLM consumption."""
@@ -355,8 +488,8 @@ class DatasetFormatter:
         offset: Optional[int] = None,
         total_count: Optional[int] = None,
         fields_metadata: Optional[Dict[str, Any]] = None,
-        next_uri: Optional[str] = None,
-        prev_uri: Optional[str] = None,
+        next_hint: Optional[str] = None,
+        prev_hint: Optional[str] = None,
         current_page: Optional[int] = None,
         total_pages: Optional[int] = None,
     ) -> str:
@@ -370,8 +503,8 @@ class DatasetFormatter:
             offset: Offset used in search
             total_count: Total count of matching records
             fields_metadata: Optional field metadata for rich formatting
-            next_uri: URI for next page of results
-            prev_uri: URI for previous page of results
+            next_hint: How to fetch the next page of results
+            prev_hint: How to fetch the previous page of results
             current_page: Current page number
             total_pages: Total number of pages
 
@@ -412,7 +545,11 @@ class DatasetFormatter:
             for idx, record in enumerate(records, 1):
                 if offset:
                     idx = offset + idx
-                lines.append(f"[{idx}] {self.record_formatter._get_record_summary(record)}")
+                # The position is not the record ID; name the ID next to it
+                summary = self.record_formatter._get_record_summary(record)
+                if "id" in record and not summary.startswith("ID:"):
+                    summary = f"ID {record['id']}: {summary}"
+                lines.append(f"[{idx}] {summary}")
 
                 # Add selected field values if specific fields were requested
                 if fields and len(fields) <= 5:  # Only show inline for small field sets
@@ -424,12 +561,12 @@ class DatasetFormatter:
 
                 lines.append("")
 
-        # Add navigation links
+        # Add navigation hints
         navigation = []
-        if prev_uri:
-            navigation.append(f"← Previous page: {prev_uri}")
-        if next_uri:
-            navigation.append(f"→ Next page: {next_uri}")
+        if prev_hint:
+            navigation.append(f"← Previous page: {prev_hint}")
+        if next_hint:
+            navigation.append(f"→ Next page: {next_hint}")
 
         if navigation:
             lines.append("\nNavigation:")
@@ -475,14 +612,14 @@ class DatasetFormatter:
         Returns:
             Formatted value string
         """
-        if value is None or value is False:
+        if isinstance(value, bool):
+            return "Yes" if value else "No"
+        if value is None:
             return "Not set"
         elif isinstance(value, (list, tuple)) and len(value) == 2:
             # Many2one value
             return f"{value[1]} (ID: {value[0]})"
         elif isinstance(value, list):
             return f"{len(value)} items"
-        elif isinstance(value, bool):
-            return "Yes" if value else "No"
         else:
             return str(value)
